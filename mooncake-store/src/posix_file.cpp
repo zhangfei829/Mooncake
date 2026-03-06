@@ -50,7 +50,7 @@ tl::expected<size_t, ErrorCode> PosixFile::write(std::span<const char> data,
     size_t remaining = length;
     size_t written_bytes = 0;
     const char *ptr = data.data();
-
+    printf("PosixFile::write, length: %zu\n", length);
     while (remaining > 0) {
         ssize_t written = ::write(fd_, ptr, remaining);
         if (written == -1) {
