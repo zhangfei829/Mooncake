@@ -565,6 +565,19 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
       m_multiplier_bits(multiplier_bits),
       m_capacity(size) {}
 
+std::shared_ptr<OffsetAllocator> OffsetAllocator::createAligned(
+    uint64_t base, size_t size, size_t min_alignment, uint32 init_capacity,
+    uint32 max_capacity) {
+    uint64_t min_bits = 0;
+    while ((1ULL << min_bits) < min_alignment) min_bits++;
+
+    uint64_t bits = std::max(calculateMultiplier(size), min_bits);
+    auto allocator = std::make_unique<__Allocator>(
+        static_cast<uint32>(size >> bits), init_capacity, max_capacity);
+    return std::shared_ptr<OffsetAllocator>(
+        new OffsetAllocator(base, size, bits, std::move(allocator)));
+}
+
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     if (size == 0) {
         return std::nullopt;

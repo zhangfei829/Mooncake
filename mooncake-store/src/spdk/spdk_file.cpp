@@ -1,0 +1,220 @@
+#include <cstring>
+#include <glog/logging.h>
+
+#include "file_interface.h"
+#include "spdk/spdk_env.h"
+
+extern "C" {
+#include "spdk/bdev.h"
+}
+
+namespace mooncake {
+
+SpdkFile::SpdkFile(const std::string &filename, uint64_t base_offset,
+                   uint64_t max_size)
+    : StorageFile(filename, -1),
+      base_offset_(base_offset),
+      current_offset_(0),
+      max_size_(max_size),
+      block_size_(SpdkEnv::Instance().GetBlockSize()) {
+    if (!SpdkEnv::Instance().IsInitialized()) {
+        error_code_ = ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+SpdkFile::~SpdkFile() { fd_ = -1; }
+
+// ---------------------------------------------------------------------------
+// Sequential write
+// ---------------------------------------------------------------------------
+tl::expected<size_t, ErrorCode> SpdkFile::write(const std::string &buffer,
+                                                size_t length) {
+    return write(std::span<const char>(buffer.data(), length), length);
+}
+
+tl::expected<size_t, ErrorCode> SpdkFile::write(std::span<const char> data,
+                                                size_t length) {
+    if (error_code_ != ErrorCode::OK) {
+        return make_error<size_t>(error_code_);
+    }
+    if (length == 0) {
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+    }
+    if (max_size_ > 0 && current_offset_ + length > max_size_) {
+        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    auto &env = SpdkEnv::Instance();
+    size_t aligned_len = align_up(length);
+    void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+    if (!dma_buf) {
+        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    std::memcpy(dma_buf, data.data(), length);
+    if (aligned_len > length) {
+        std::memset(static_cast<char *>(dma_buf) + length, 0,
+                    aligned_len - length);
+    }
+
+    SpdkIoRequest req;
+    req.op = SpdkIoRequest::WRITE;
+    req.buf = dma_buf;
+    req.offset = base_offset_ + current_offset_;
+    req.nbytes = aligned_len;
+    env.SubmitIo(&req);
+
+    env.DmaFree(dma_buf);
+    if (!req.success) {
+        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    current_offset_ += length;
+    return length;
+}
+
+// ---------------------------------------------------------------------------
+// Sequential read
+// ---------------------------------------------------------------------------
+tl::expected<size_t, ErrorCode> SpdkFile::read(std::string &buffer,
+                                               size_t length) {
+    if (error_code_ != ErrorCode::OK) {
+        return make_error<size_t>(error_code_);
+    }
+    if (length == 0) {
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+    }
+
+    auto &env = SpdkEnv::Instance();
+    size_t aligned_len = align_up(length);
+    void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+    if (!dma_buf) {
+        return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+    }
+
+    SpdkIoRequest req;
+    req.op = SpdkIoRequest::READ;
+    req.buf = dma_buf;
+    req.offset = base_offset_ + current_offset_;
+    req.nbytes = aligned_len;
+    env.SubmitIo(&req);
+
+    if (!req.success) {
+        env.DmaFree(dma_buf);
+        return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+    }
+
+    buffer.assign(static_cast<const char *>(dma_buf), length);
+    env.DmaFree(dma_buf);
+
+    current_offset_ += length;
+    return length;
+}
+
+// ---------------------------------------------------------------------------
+// Vectored write at explicit offset (relative to base_offset_)
+// ---------------------------------------------------------------------------
+tl::expected<size_t, ErrorCode> SpdkFile::vector_write(const iovec *iov,
+                                                       int iovcnt,
+                                                       off_t offset) {
+    if (error_code_ != ErrorCode::OK) {
+        return make_error<size_t>(error_code_);
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
+    if (total == 0) {
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+    }
+
+    auto &env = SpdkEnv::Instance();
+    size_t aligned_len = align_up(total);
+    void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+    if (!dma_buf) {
+        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    char *dst = static_cast<char *>(dma_buf);
+    for (int i = 0; i < iovcnt; ++i) {
+        std::memcpy(dst, iov[i].iov_base, iov[i].iov_len);
+        dst += iov[i].iov_len;
+    }
+    if (aligned_len > total) {
+        std::memset(dst, 0, aligned_len - total);
+    }
+
+    uint64_t abs_offset =
+        base_offset_ + static_cast<uint64_t>(offset);
+    size_t aligned_offset = abs_offset & ~(static_cast<size_t>(block_size_) - 1);
+    if (abs_offset != aligned_offset) {
+        LOG(WARNING) << "SpdkFile: vector_write offset not block-aligned, "
+                        "rounding down "
+                     << abs_offset << " → " << aligned_offset;
+    }
+
+    SpdkIoRequest req;
+    req.op = SpdkIoRequest::WRITE;
+    req.buf = dma_buf;
+    req.offset = aligned_offset;
+    req.nbytes = aligned_len;
+    env.SubmitIo(&req);
+
+    env.DmaFree(dma_buf);
+    if (!req.success) {
+        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// Vectored read at explicit offset (relative to base_offset_)
+// ---------------------------------------------------------------------------
+tl::expected<size_t, ErrorCode> SpdkFile::vector_read(const iovec *iov,
+                                                      int iovcnt,
+                                                      off_t offset) {
+    if (error_code_ != ErrorCode::OK) {
+        return make_error<size_t>(error_code_);
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
+    if (total == 0) {
+        return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
+    }
+
+    auto &env = SpdkEnv::Instance();
+    uint64_t abs_offset =
+        base_offset_ + static_cast<uint64_t>(offset);
+    size_t aligned_offset =
+        abs_offset & ~(static_cast<size_t>(block_size_) - 1);
+    size_t skip = abs_offset - aligned_offset;
+    size_t aligned_len = align_up(total + skip);
+
+    void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+    if (!dma_buf) {
+        return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+    }
+
+    SpdkIoRequest req;
+    req.op = SpdkIoRequest::READ;
+    req.buf = dma_buf;
+    req.offset = aligned_offset;
+    req.nbytes = aligned_len;
+    env.SubmitIo(&req);
+
+    if (!req.success) {
+        env.DmaFree(dma_buf);
+        return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+    }
+
+    const char *src = static_cast<const char *>(dma_buf) + skip;
+    for (int i = 0; i < iovcnt; ++i) {
+        std::memcpy(iov[i].iov_base, src, iov[i].iov_len);
+        src += iov[i].iov_len;
+    }
+
+    env.DmaFree(dma_buf);
+    return total;
+}
+
+}  // namespace mooncake

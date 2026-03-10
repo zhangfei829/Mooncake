@@ -141,6 +141,14 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
         uint64_t base, size_t size, uint32 init_capacity = 128 * 1024,
         uint32 max_capacity = (1 << 20));
 
+    // Factory method with minimum alignment guarantee.
+    // All returned offsets and internal sizes will be multiples of
+    // min_alignment bytes (must be a power of 2).
+    static std::shared_ptr<OffsetAllocator> createAligned(
+        uint64_t base, size_t size, size_t min_alignment,
+        uint32 init_capacity = 128 * 1024,
+        uint32 max_capacity = (1 << 20));
+
     // Disable copy constructor and copy assignment
     OffsetAllocator(const OffsetAllocator&) = delete;
     OffsetAllocator& operator=(const OffsetAllocator&) = delete;

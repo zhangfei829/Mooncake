@@ -89,6 +89,44 @@ else()
   message(STATUS "io_uring: Disabled (liburing not found)")
 endif()
 
+# SPDK support (opt-in via -DUSE_SPDK=ON -DSPDK_DIR=<path>)
+if(USE_SPDK)
+  if(NOT SPDK_DIR)
+    set(SPDK_DIR "${CMAKE_SOURCE_DIR}/spdk" CACHE PATH "Path to SPDK source/build tree")
+  endif()
+  set(SPDK_INCLUDE_DIR "${SPDK_DIR}/build/include" "${SPDK_DIR}/include"
+                       "${SPDK_DIR}/module" "${SPDK_DIR}/dpdk/build/include")
+  set(SPDK_LIB_DIR     "${SPDK_DIR}/build/lib" "${SPDK_DIR}/dpdk/build/lib")
+
+  find_path(SPDK_INCLUDE spdk/bdev.h PATHS ${SPDK_INCLUDE_DIR} NO_DEFAULT_PATH)
+  if(NOT SPDK_INCLUDE)
+    message(FATAL_ERROR "SPDK headers not found. Set SPDK_DIR to your SPDK build tree.")
+  endif()
+
+  set(SPDK_LINK_LIBS
+    spdk_bdev spdk_bdev_malloc spdk_bdev_nvme
+    spdk_nvme spdk_vmd
+    spdk_env_dpdk spdk_thread spdk_log spdk_util spdk_json spdk_jsonrpc
+    spdk_rpc spdk_sock spdk_sock_posix spdk_notify spdk_trace
+    rte_eal rte_mempool rte_ring rte_telemetry rte_kvargs rte_pci rte_bus_pci
+  )
+
+  set(SPDK_FOUND_LIBS "")
+  foreach(lib ${SPDK_LINK_LIBS})
+    find_library(SPDK_LIB_${lib} ${lib} PATHS ${SPDK_LIB_DIR} NO_DEFAULT_PATH)
+    if(SPDK_LIB_${lib})
+      list(APPEND SPDK_FOUND_LIBS ${SPDK_LIB_${lib}})
+    else()
+      message(WARNING "SPDK lib not found: ${lib} (non-fatal, may be statically linked)")
+    endif()
+  endforeach()
+
+  add_subdirectory(spdk)
+  list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_SOURCES})
+  list(APPEND EXTRA_LIBS ${SPDK_FOUND_LIBS} numa dl uuid pthread)
+  message(STATUS "SPDK: Enabled for mooncake_store (SPDK_DIR=${SPDK_DIR})")
+endif()
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
@@ -113,6 +151,11 @@ endif()
 if(URING_LIB AND URING_INCLUDE)
     target_compile_definitions(mooncake_store PUBLIC USE_URING)
     target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
+endif()
+
+if(USE_SPDK)
+    target_compile_definitions(mooncake_store PUBLIC USE_SPDK)
+    target_include_directories(mooncake_store PUBLIC ${SPDK_INCLUDE_DIR})
 endif()
 
 if (USE_ASCEND_DIRECT OR USE_UBSHMEM)

@@ -252,6 +252,38 @@ class UringFile : public StorageFile {
 };
 #endif  // USE_URING
 
+#ifdef USE_SPDK
+class SpdkFile : public StorageFile {
+   public:
+    SpdkFile(const std::string &filename, uint64_t base_offset,
+             uint64_t max_size);
+    ~SpdkFile() override;
+
+    tl::expected<size_t, ErrorCode> write(const std::string &buffer,
+                                          size_t length) override;
+    tl::expected<size_t, ErrorCode> write(std::span<const char> data,
+                                          size_t length) override;
+    tl::expected<size_t, ErrorCode> read(std::string &buffer,
+                                         size_t length) override;
+    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt,
+                                                 off_t offset) override;
+    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
+                                                off_t offset) override;
+
+   private:
+    static constexpr size_t BLOCK_ALIGN = 4096;
+
+    static size_t align_up(size_t v) {
+        return (v + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
+    }
+
+    uint64_t base_offset_;
+    uint64_t current_offset_;
+    uint64_t max_size_;
+    uint32_t block_size_;
+};
+#endif  // USE_SPDK
+
 }  // namespace mooncake
 
 #ifdef USE_3FS

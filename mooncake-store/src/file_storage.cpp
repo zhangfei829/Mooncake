@@ -60,6 +60,11 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     auto use_uring_str = GetEnvStringOr("MOONCAKE_USE_URING", "false");
     config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
 
+    auto use_spdk_str = GetEnvStringOr("MOONCAKE_USE_SPDK", "false");
+    config.use_spdk = (use_spdk_str == "true" || use_spdk_str == "1");
+    config.spdk_bdev_name =
+        GetEnvStringOr("MOONCAKE_SPDK_BDEV_NAME", config.spdk_bdev_name);
+
     return config;
 }
 

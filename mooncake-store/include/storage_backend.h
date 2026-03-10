@@ -204,6 +204,10 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // Use SPDK user-space driver for block device I/O (zero syscall path)
+    bool use_spdk = false;
+    std::string spdk_bdev_name;  // SPDK bdev name, e.g. "Malloc0" or "NVMe0n1"
+
     // Validates the configuration for correctness and consistency
     bool Validate() const;
 
@@ -450,6 +454,7 @@ class StorageBackend {
     bool enable_eviction_{
         true};  // User-configurable flag to enable/disable eviction
     bool use_uring_{false};  // Use io_uring for file I/O
+    bool use_spdk_{false};   // Use SPDK for block device I/O
 
 #ifdef USE_3FS
     bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS

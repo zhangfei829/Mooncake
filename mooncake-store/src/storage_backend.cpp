@@ -22,6 +22,10 @@
 
 #include <ylt/util/tl/expected.hpp>
 
+#ifdef USE_SPDK
+#include "spdk/spdk_env.h"
+#endif
+
 namespace mooncake {
 
 bool FilePerKeyConfig::Validate() const {
@@ -779,6 +783,14 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
         return std::make_unique<UringFile>(path, fd, 32, true);
     }
 #endif
+
+#ifdef USE_SPDK
+    if (use_spdk_) {
+        if (fd >= 0) close(fd);
+        return std::make_unique<SpdkFile>(path, 0, 0);
+    }
+#endif
+
     return std::make_unique<PosixFile>(path, fd);
 }
 
@@ -2437,60 +2449,95 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Get data file path
         data_file_path_ = GetDataFilePath();
 
-        // RAII wrapper to ensure fd is closed on all error paths
-        struct FdGuard {
-            int fd;
-            explicit FdGuard(int fd) : fd(fd) {}
-            ~FdGuard() {
-                if (fd >= 0) {
-                    close(fd);
-                }
+#ifdef USE_SPDK
+        if (file_storage_config_.use_spdk) {
+            SpdkEnvConfig spdk_cfg;
+            spdk_cfg.bdev_name = file_storage_config_.spdk_bdev_name;
+            int rc = SpdkEnv::Instance().Init(spdk_cfg);
+            if (rc != 0) {
+                LOG(ERROR) << "Failed to initialize SPDK environment, rc="
+                           << rc;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
-            // Release ownership (caller takes responsibility)
-            int release() {
-                int ret = fd;
-                fd = -1;
-                return ret;
+
+            uint64_t bdev_size = SpdkEnv::Instance().GetBdevSize();
+            if (capacity_ > bdev_size) {
+                LOG(WARNING) << "Requested capacity " << capacity_
+                             << " exceeds bdev size " << bdev_size
+                             << ", clamping to bdev size";
+                capacity_ = bdev_size;
             }
-            // Get fd without releasing (for operations)
-            int get() const { return fd; }
-        };
 
-        // Open/truncate data file in read-write mode
-        // We need raw fd for fallocate, so open directly
-        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
-        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
-        if (raw_fd < 0) {
-            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-        }
-        FdGuard fd_guard(raw_fd);
+            data_file_ = std::make_unique<SpdkFile>(
+                data_file_path_, 0, capacity_);
 
-        // Use fallocate if available, otherwise ftruncate
-        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
-            // Fallback to ftruncate
-            if (ftruncate(fd_guard.get(), capacity_) != 0) {
-                LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
-                           << ", capacity: " << capacity_
-                           << ", error: " << strerror(errno);
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-            }
-        }
-
-        // Release fd to StorageFile (takes ownership and will close it)
-#ifdef USE_URING
-        if (file_storage_config_.use_uring) {
-            data_file_ = std::make_unique<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
+            LOG(INFO)
+                << "OffsetAllocatorStorageBackend: using SPDK bdev '"
+                << file_storage_config_.spdk_bdev_name
+                << "', capacity=" << capacity_;
         } else
 #endif
         {
-            data_file_ = std::make_unique<PosixFile>(data_file_path_,
-                                                     fd_guard.release());
+            // RAII wrapper to ensure fd is closed on all error paths
+            struct FdGuard {
+                int fd;
+                explicit FdGuard(int fd) : fd(fd) {}
+                ~FdGuard() {
+                    if (fd >= 0) {
+                        close(fd);
+                    }
+                }
+                int release() {
+                    int ret = fd;
+                    fd = -1;
+                    return ret;
+                }
+                int get() const { return fd; }
+            };
+
+            int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+            int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+            if (raw_fd < 0) {
+                LOG(ERROR) << "Failed to open data file: "
+                           << data_file_path_;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            FdGuard fd_guard(raw_fd);
+
+            if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
+                if (ftruncate(fd_guard.get(), capacity_) != 0) {
+                    LOG(ERROR) << "Failed to preallocate file: "
+                               << data_file_path_
+                               << ", capacity: " << capacity_
+                               << ", error: " << strerror(errno);
+                    return tl::make_unexpected(
+                        ErrorCode::FILE_WRITE_FAIL);
+                }
+            }
+
+#ifdef USE_URING
+            if (file_storage_config_.use_uring) {
+                data_file_ = std::make_unique<UringFile>(
+                    data_file_path_, fd_guard.release(), 32, true);
+            } else
+#endif
+            {
+                data_file_ = std::make_unique<PosixFile>(
+                    data_file_path_, fd_guard.release());
+            }
         }
 
         // Create allocator with base=0, size=capacity
-        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
+#ifdef USE_SPDK
+        if (file_storage_config_.use_spdk) {
+            allocator_ = offset_allocator::OffsetAllocator::createAligned(
+                0, capacity_, SpdkEnv::Instance().GetBlockSize());
+        } else
+#endif
+        {
+            allocator_ = offset_allocator::OffsetAllocator::create(
+                0, capacity_);
+        }
         if (!allocator_) {
             LOG(ERROR) << "Failed to create OffsetAllocator";
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
