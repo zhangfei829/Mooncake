@@ -8,9 +8,13 @@
 #include <string>
 #include <thread>
 
+namespace mooncake { class SpdkEnv; }
+
 void bdev_init_complete_cb(void *ctx, int rc);
 void execute_io_cb(void *ctx);
 void app_start_cb(void *ctx);
+void open_bdev_cb(void *ctx);
+void signal_init_done(mooncake::SpdkEnv *env, int rc);
 
 namespace mooncake {
 
@@ -74,6 +78,8 @@ class SpdkEnv {
     friend void ::bdev_init_complete_cb(void *, int);
     friend void ::execute_io_cb(void *);
     friend void ::app_start_cb(void *);
+    friend void ::open_bdev_cb(void *);
+    friend void ::signal_init_done(mooncake::SpdkEnv *, int);
 
     std::atomic<bool> initialized_{false};
     std::atomic<bool> should_stop_{false};

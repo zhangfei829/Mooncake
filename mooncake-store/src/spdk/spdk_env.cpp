@@ -67,39 +67,26 @@ void execute_io_cb(void *ctx) {
 // spdk_app_start callback — runs on the SPDK reactor thread.
 // Opens bdev, gets io_channel, signals the main thread.
 // ---------------------------------------------------------------------------
-void app_start_cb(void *ctx) {
+static void signal_init_done(mooncake::SpdkEnv *env, int rc) {
+    env->init_result_ = rc;
+    {
+        std::lock_guard<std::mutex> lk(env->init_mutex_);
+        env->init_complete_ = true;
+    }
+    env->init_cv_.notify_one();
+    if (rc != 0) spdk_app_stop(-1);
+}
+
+static void open_bdev_cb(void *ctx) {
     auto *env = static_cast<mooncake::SpdkEnv *>(ctx);
     auto &cfg = env->config_;
-
-    if (cfg.use_malloc_bdev) {
-        struct malloc_bdev_opts mopts = {};
-        mopts.name = const_cast<char *>(cfg.bdev_name.c_str());
-        mopts.num_blocks = cfg.malloc_num_blocks;
-        mopts.block_size = cfg.malloc_block_size;
-        struct spdk_bdev *mbdev = nullptr;
-        int mrc = create_malloc_disk(&mbdev, &mopts);
-        if (mrc != 0) {
-            LOG(ERROR) << "SpdkEnv: create_malloc_disk failed rc=" << mrc;
-            env->init_result_ = mrc;
-            std::lock_guard<std::mutex> lk(env->init_mutex_);
-            env->init_complete_ = true;
-            env->init_cv_.notify_one();
-            spdk_app_stop(-1);
-            return;
-        }
-        LOG(INFO) << "SpdkEnv: created Malloc bdev '" << cfg.bdev_name << "'";
-    }
 
     struct spdk_bdev_desc *desc = nullptr;
     int rc = spdk_bdev_open_ext(cfg.bdev_name.c_str(), true,
                                 bdev_event_cb, nullptr, &desc);
     if (rc != 0) {
         LOG(ERROR) << "SpdkEnv: spdk_bdev_open_ext failed rc=" << rc;
-        env->init_result_ = rc;
-        std::lock_guard<std::mutex> lk(env->init_mutex_);
-        env->init_complete_ = true;
-        env->init_cv_.notify_one();
-        spdk_app_stop(-1);
+        signal_init_done(env, rc);
         return;
     }
     env->bdev_desc_ = desc;
@@ -115,11 +102,7 @@ void app_start_cb(void *ctx) {
         LOG(ERROR) << "SpdkEnv: spdk_bdev_get_io_channel failed";
         spdk_bdev_close(desc);
         env->bdev_desc_ = nullptr;
-        env->init_result_ = -1;
-        std::lock_guard<std::mutex> lk(env->init_mutex_);
-        env->init_complete_ = true;
-        env->init_cv_.notify_one();
-        spdk_app_stop(-1);
+        signal_init_done(env, -1);
         return;
     }
     env->io_channel_ = ch;
@@ -128,13 +111,30 @@ void app_start_cb(void *ctx) {
     LOG(INFO) << "SpdkEnv: bdev '" << cfg.bdev_name
               << "' opened — block_size=" << env->block_size_
               << " total_size=" << env->bdev_size_;
+    signal_init_done(env, 0);
+}
 
-    env->init_result_ = 0;
-    {
-        std::lock_guard<std::mutex> lk(env->init_mutex_);
-        env->init_complete_ = true;
+void app_start_cb(void *ctx) {
+    auto *env = static_cast<mooncake::SpdkEnv *>(ctx);
+    auto &cfg = env->config_;
+
+    if (cfg.use_malloc_bdev) {
+        struct malloc_bdev_opts mopts = {};
+        mopts.name = const_cast<char *>(cfg.bdev_name.c_str());
+        mopts.num_blocks = cfg.malloc_num_blocks;
+        mopts.block_size = cfg.malloc_block_size;
+        struct spdk_bdev *mbdev = nullptr;
+        int mrc = create_malloc_disk(&mbdev, &mopts);
+        if (mrc != 0) {
+            LOG(ERROR) << "SpdkEnv: create_malloc_disk failed rc=" << mrc;
+            signal_init_done(env, mrc);
+            return;
+        }
+        LOG(INFO) << "SpdkEnv: created Malloc bdev '" << cfg.bdev_name << "'";
     }
-    env->init_cv_.notify_one();
+
+    // Defer bdev open to next reactor poll so io_device registration completes
+    spdk_thread_send_msg(spdk_get_thread(), open_bdev_cb, ctx);
 }
 
 namespace mooncake {
