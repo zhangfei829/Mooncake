@@ -119,10 +119,13 @@ if(USE_SPDK)
   if(SPDK_PC_RC EQUAL 0 AND SPDK_LDFLAGS)
     message(STATUS "SPDK: Using pkg-config link flags")
     separate_arguments(SPDK_LDFLAGS_LIST UNIX_COMMAND "${SPDK_LDFLAGS}")
+
     add_subdirectory(spdk)
     list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_SOURCES})
+    # ISA-L lives inside the SPDK build tree; add its directory to linker search
+    link_directories("${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/build/lib")
     list(APPEND EXTRA_LIBS ${SPDK_LDFLAGS_LIST}
-      ssl crypto numa dl uuid pthread aio)
+      isal ssl crypto numa dl uuid pthread aio)
   else()
     message(STATUS "SPDK: pkg-config unavailable, falling back to manual linking")
     # Minimal set — no NVMe (avoids fuse3 dep), no VMD
