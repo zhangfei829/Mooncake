@@ -116,24 +116,11 @@ if(USE_SPDK)
     RESULT_VARIABLE SPDK_PC_RC
   )
 
-  # Complete whitelist of SPDK libs needed for Malloc bdev + spdk_app_start.
-  # Uses EXISTS to skip libs that may not exist in a given SPDK build.
-  set(_SPDK_LIB_NAMES
-    event event_bdev event_accel event_keyring event_iobuf event_sock event_scheduler
-    init bdev bdev_malloc accel dma iobuf
-    keyring keyring_file keyring_linux
-    env_dpdk thread log util json jsonrpc rpc
-    sock sock_posix notify trace
-  )
-  set(SPDK_SELECTED_LIBS "")
-  foreach(_n ${_SPDK_LIB_NAMES})
-    set(_p "${SPDK_DIR}/build/lib/libspdk_${_n}.a")
-    if(EXISTS "${_p}")
-      list(APPEND SPDK_SELECTED_LIBS "${_p}")
-    endif()
-  endforeach()
-
+  # Include ALL SPDK + DPDK libs (same as SPDK's own build for examples).
+  # Only exclude ut/ut_mock (test stubs requiring CUnit + --wrap).
+  file(GLOB SPDK_SELECTED_LIBS "${SPDK_DIR}/build/lib/libspdk_*.a")
   file(GLOB DPDK_ALL_LIBS "${SPDK_DIR}/dpdk/build/lib/librte_*.a")
+  list(FILTER SPDK_SELECTED_LIBS EXCLUDE REGEX "libspdk_ut\\.a$|libspdk_ut_mock")
 
   if(TRUE)
     message(STATUS "SPDK: Using whole-archive DPDK + start-group SPDK linking")
@@ -143,7 +130,7 @@ if(USE_SPDK)
     link_directories("${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/isa-l-crypto/.libs" "${SPDK_DIR}/build/lib")
     list(APPEND EXTRA_LIBS
       -Wl,--whole-archive ${SPDK_SELECTED_LIBS} ${DPDK_ALL_LIBS} -Wl,--no-whole-archive
-      isal isal_crypto ssl crypto numa dl uuid pthread aio keyutils)
+      isal isal_crypto ssl crypto numa dl uuid pthread aio keyutils fuse3 m)
   else()
     message(STATUS "SPDK: pkg-config unavailable, falling back to manual linking")
     # Minimal set — no NVMe (avoids fuse3 dep), no VMD
