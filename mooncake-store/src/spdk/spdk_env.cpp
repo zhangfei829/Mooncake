@@ -23,18 +23,18 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // File-local SPDK callbacks (pure C linkage, outside mooncake namespace)
 // ---------------------------------------------------------------------------
-static void bdev_init_complete_cb(void *ctx, int rc) {
+void bdev_init_complete_cb(void *ctx, int rc) {
     auto *env = static_cast<mooncake::SpdkEnv *>(ctx);
     env->bdev_init_rc_ = rc;
     env->bdev_init_done_.store(true, std::memory_order_release);
 }
 
-static void bdev_event_cb(enum spdk_bdev_event_type type,
+static void bdev_event_cb(enum spdk_bdev_event_type type,  // NOLINT
                            struct spdk_bdev * /*bdev*/, void * /*ctx*/) {
     LOG(INFO) << "SpdkEnv: bdev event type=" << static_cast<int>(type);
 }
 
-static void execute_io_cb(void *ctx) {
+void execute_io_cb(void *ctx) {
     auto *req = static_cast<mooncake::SpdkIoRequest *>(ctx);
     auto &env = mooncake::SpdkEnv::Instance();
 
