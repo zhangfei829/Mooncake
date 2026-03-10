@@ -243,20 +243,24 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
     return 0;
 }
 
+static void cleanup_on_spdk_thread(void *ctx) {
+    auto *env = static_cast<SpdkEnv *>(ctx);
+    if (env->io_channel_) {
+        spdk_put_io_channel(SPDK_CHAN(env->io_channel_));
+        env->io_channel_ = nullptr;
+    }
+    if (env->bdev_desc_) {
+        spdk_bdev_close(SPDK_DESC(env->bdev_desc_));
+        env->bdev_desc_ = nullptr;
+    }
+    spdk_app_stop(0);
+}
+
 void SpdkEnv::Shutdown() {
     if (!initialized_.load(std::memory_order_acquire)) return;
     initialized_.store(false, std::memory_order_release);
 
-    if (io_channel_) {
-        spdk_put_io_channel(SPDK_CHAN(io_channel_));
-        io_channel_ = nullptr;
-    }
-    if (bdev_desc_) {
-        spdk_bdev_close(SPDK_DESC(bdev_desc_));
-        bdev_desc_ = nullptr;
-    }
-
-    spdk_app_stop(0);
+    spdk_thread_send_msg(SPDK_THREAD(spdk_thread_), cleanup_on_spdk_thread, this);
     if (reactor_thread_.joinable()) reactor_thread_.join();
 
     LOG(INFO) << "SpdkEnv: shutdown complete";
