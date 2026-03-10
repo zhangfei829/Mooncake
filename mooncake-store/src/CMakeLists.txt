@@ -103,29 +103,53 @@ if(USE_SPDK)
     message(FATAL_ERROR "SPDK headers not found. Set SPDK_DIR to your SPDK build tree.")
   endif()
 
-  set(SPDK_LINK_LIBS
-    spdk_bdev spdk_bdev_malloc spdk_bdev_nvme
-    spdk_nvme spdk_vmd
-    spdk_env_dpdk spdk_thread spdk_log spdk_util spdk_json spdk_jsonrpc
-    spdk_rpc spdk_sock spdk_sock_posix spdk_notify spdk_trace
-    rte_eal rte_mempool rte_ring rte_telemetry rte_kvargs rte_pci rte_bus_pci
+  # Use SPDK's own pkg-config for correct library ordering and deps.
+  # This is the officially recommended way to link SPDK.
+  find_package(PkgConfig REQUIRED)
+  set(SPDK_PC_PATH "${SPDK_DIR}/build/lib/pkgconfig:${SPDK_DIR}/dpdk/build/lib/pkgconfig")
+  set(ENV{PKG_CONFIG_PATH} "${SPDK_PC_PATH}:$ENV{PKG_CONFIG_PATH}")
+
+  execute_process(
+    COMMAND pkg-config --libs --static spdk_bdev spdk_bdev_malloc spdk_env_dpdk
+    OUTPUT_VARIABLE SPDK_LDFLAGS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE SPDK_PC_RC
   )
 
-  set(SPDK_FOUND_LIBS "")
-  foreach(lib ${SPDK_LINK_LIBS})
-    find_library(SPDK_LIB_${lib} ${lib} PATHS ${SPDK_LIB_DIR} NO_DEFAULT_PATH)
-    if(SPDK_LIB_${lib})
-      list(APPEND SPDK_FOUND_LIBS ${SPDK_LIB_${lib}})
-    else()
-      message(WARNING "SPDK lib not found: ${lib} (non-fatal, may be statically linked)")
-    endif()
-  endforeach()
+  if(SPDK_PC_RC EQUAL 0 AND SPDK_LDFLAGS)
+    message(STATUS "SPDK: Using pkg-config link flags")
+    # Convert pkg-config output to a cmake list and append
+    separate_arguments(SPDK_LDFLAGS_LIST UNIX_COMMAND "${SPDK_LDFLAGS}")
+    add_subdirectory(spdk)
+    list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_SOURCES})
+    list(APPEND EXTRA_LIBS ${SPDK_LDFLAGS_LIST})
+  else()
+    message(STATUS "SPDK: pkg-config unavailable, falling back to manual linking")
+    # Minimal set — no NVMe (avoids fuse3 dep), no VMD
+    set(SPDK_LINK_LIBS
+      spdk_bdev spdk_bdev_malloc
+      spdk_env_dpdk spdk_thread spdk_log spdk_util spdk_json spdk_jsonrpc
+      spdk_rpc spdk_sock spdk_sock_posix spdk_notify spdk_trace
+      rte_eal rte_mempool rte_ring rte_telemetry rte_kvargs
+    )
+    set(SPDK_FOUND_LIBS "")
+    foreach(lib ${SPDK_LINK_LIBS})
+      find_library(SPDK_LIB_${lib} ${lib} PATHS ${SPDK_LIB_DIR} NO_DEFAULT_PATH)
+      if(SPDK_LIB_${lib})
+        list(APPEND SPDK_FOUND_LIBS ${SPDK_LIB_${lib}})
+      endif()
+    endforeach()
 
-  add_subdirectory(spdk)
-  list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_SOURCES})
-  list(APPEND EXTRA_LIBS
-    -Wl,--whole-archive ${SPDK_FOUND_LIBS} -Wl,--no-whole-archive
-    numa dl uuid pthread ssl crypto aio)
+    # ISA-L (CRC/XOR acceleration, required by spdk_util)
+    find_library(ISAL_LIB isal PATHS
+      "${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/build/lib" /usr/lib /usr/lib64)
+
+    add_subdirectory(spdk)
+    list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_SOURCES})
+    list(APPEND EXTRA_LIBS
+      -Wl,--start-group ${SPDK_FOUND_LIBS} -Wl,--end-group
+      ${ISAL_LIB} numa dl uuid pthread ssl crypto aio)
+  endif()
   message(STATUS "SPDK: Enabled for mooncake_store (SPDK_DIR=${SPDK_DIR})")
 endif()
 
