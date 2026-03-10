@@ -240,7 +240,7 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
               << (probe ? "OK" : "FAILED — DPDK has no hugepage memory");
     if (probe) spdk_dma_free(probe);
 
-    rc = spdk_thread_lib_init_ext(nullptr, nullptr, nullptr, 0, 8192);
+    rc = spdk_thread_lib_init_ext(nullptr, nullptr, 0, 8192);
     if (rc != 0) {
         LOG(ERROR) << "SpdkEnv: spdk_thread_lib_init_ext failed rc=" << rc;
         return rc;
