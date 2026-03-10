@@ -116,15 +116,37 @@ if(USE_SPDK)
     RESULT_VARIABLE SPDK_PC_RC
   )
 
-  if(SPDK_PC_RC EQUAL 0 AND SPDK_LDFLAGS)
-    message(STATUS "SPDK: Using pkg-config link flags")
-    separate_arguments(SPDK_LDFLAGS_LIST UNIX_COMMAND "${SPDK_LDFLAGS}")
+  # DPDK mempool drivers use __attribute__((constructor)) for registration,
+  # so we must --whole-archive DPDK libs. SPDK libs only need --start-group.
+  file(GLOB DPDK_ALL_LIBS "${SPDK_DIR}/dpdk/build/lib/librte_*.a")
+  set(SPDK_SELECTED_LIBS
+    "${SPDK_DIR}/build/lib/libspdk_event.a"
+    "${SPDK_DIR}/build/lib/libspdk_event_bdev.a"
+    "${SPDK_DIR}/build/lib/libspdk_bdev.a"
+    "${SPDK_DIR}/build/lib/libspdk_bdev_malloc.a"
+    "${SPDK_DIR}/build/lib/libspdk_notify.a"
+    "${SPDK_DIR}/build/lib/libspdk_env_dpdk.a"
+    "${SPDK_DIR}/build/lib/libspdk_thread.a"
+    "${SPDK_DIR}/build/lib/libspdk_log.a"
+    "${SPDK_DIR}/build/lib/libspdk_util.a"
+    "${SPDK_DIR}/build/lib/libspdk_json.a"
+    "${SPDK_DIR}/build/lib/libspdk_jsonrpc.a"
+    "${SPDK_DIR}/build/lib/libspdk_rpc.a"
+    "${SPDK_DIR}/build/lib/libspdk_sock.a"
+    "${SPDK_DIR}/build/lib/libspdk_sock_posix.a"
+    "${SPDK_DIR}/build/lib/libspdk_trace.a"
+    "${SPDK_DIR}/build/lib/libspdk_init.a"
+  )
+
+  if(TRUE)
+    message(STATUS "SPDK: Using whole-archive DPDK + start-group SPDK linking")
 
     add_subdirectory(spdk)
     list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_SOURCES})
-    # ISA-L lives inside the SPDK build tree; add its directory to linker search
     link_directories("${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/build/lib")
-    list(APPEND EXTRA_LIBS ${SPDK_LDFLAGS_LIST}
+    list(APPEND EXTRA_LIBS
+      -Wl,--start-group ${SPDK_SELECTED_LIBS} -Wl,--end-group
+      -Wl,--whole-archive ${DPDK_ALL_LIBS} -Wl,--no-whole-archive
       isal ssl crypto numa dl uuid pthread aio)
   else()
     message(STATUS "SPDK: pkg-config unavailable, falling back to manual linking")

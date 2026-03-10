@@ -56,16 +56,35 @@ if(USE_SPDK)
   set(_SPDK_INC "${SPDK_DIR}/build/include" "${SPDK_DIR}/include"
                 "${SPDK_DIR}/module" "${SPDK_DIR}/dpdk/build/include")
 
-  # Glob ALL SPDK + DPDK static libs — same approach SPDK uses for its own examples
-  file(GLOB _ALL_SPDK_LIBS "${SPDK_DIR}/build/lib/libspdk_*.a")
+  # DPDK libs need --whole-archive so mempool ring driver constructors run.
+  # SPDK libs use --start-group to resolve circular deps without pulling extras.
   file(GLOB _ALL_DPDK_LIBS "${SPDK_DIR}/dpdk/build/lib/librte_*.a")
+  set(_SPDK_LIBS
+    "${SPDK_DIR}/build/lib/libspdk_event.a"
+    "${SPDK_DIR}/build/lib/libspdk_event_bdev.a"
+    "${SPDK_DIR}/build/lib/libspdk_bdev.a"
+    "${SPDK_DIR}/build/lib/libspdk_bdev_malloc.a"
+    "${SPDK_DIR}/build/lib/libspdk_notify.a"
+    "${SPDK_DIR}/build/lib/libspdk_env_dpdk.a"
+    "${SPDK_DIR}/build/lib/libspdk_thread.a"
+    "${SPDK_DIR}/build/lib/libspdk_log.a"
+    "${SPDK_DIR}/build/lib/libspdk_util.a"
+    "${SPDK_DIR}/build/lib/libspdk_json.a"
+    "${SPDK_DIR}/build/lib/libspdk_jsonrpc.a"
+    "${SPDK_DIR}/build/lib/libspdk_rpc.a"
+    "${SPDK_DIR}/build/lib/libspdk_sock.a"
+    "${SPDK_DIR}/build/lib/libspdk_sock_posix.a"
+    "${SPDK_DIR}/build/lib/libspdk_trace.a"
+    "${SPDK_DIR}/build/lib/libspdk_init.a"
+  )
 
   add_executable(spdk_minimal_test spdk_minimal_test.cpp)
   target_include_directories(spdk_minimal_test PRIVATE ${_SPDK_INC})
   link_directories("${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/build/lib")
   target_link_libraries(spdk_minimal_test PRIVATE
-    -Wl,--whole-archive ${_ALL_SPDK_LIBS} ${_ALL_DPDK_LIBS} -Wl,--no-whole-archive
-    isal ssl crypto numa dl uuid pthread aio fuse3)
+    -Wl,--start-group ${_SPDK_LIBS} -Wl,--end-group
+    -Wl,--whole-archive ${_ALL_DPDK_LIBS} -Wl,--no-whole-archive
+    isal ssl crypto numa dl uuid pthread aio)
 endif()
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_subdirectory(e2e)
