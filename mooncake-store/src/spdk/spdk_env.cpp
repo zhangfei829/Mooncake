@@ -228,11 +228,19 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
         opts.mem_size = 512;
     }
 
+    LOG(INFO) << "SpdkEnv: env_opts mem_size=" << opts.mem_size
+              << " shm_id=" << opts.shm_id;
+
     int rc = spdk_env_init(&opts);
     if (rc != 0) {
         LOG(ERROR) << "SpdkEnv: spdk_env_init failed rc=" << rc;
         return rc;
     }
+
+    void *probe = spdk_dma_malloc(4096, 4096, nullptr);
+    LOG(INFO) << "SpdkEnv: DMA probe alloc "
+              << (probe ? "OK" : "FAILED — DPDK has no hugepage memory");
+    if (probe) spdk_dma_free(probe);
 
     rc = spdk_thread_lib_init(nullptr, 0);
     if (rc != 0) {
