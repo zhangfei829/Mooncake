@@ -118,23 +118,38 @@ void app_start_cb(void *ctx) {
     auto *env = static_cast<mooncake::SpdkEnv *>(ctx);
     auto &cfg = env->config_;
 
-    if (cfg.use_malloc_bdev) {
-        struct malloc_bdev_opts mopts = {};
-        mopts.name = const_cast<char *>(cfg.bdev_name.c_str());
-        mopts.num_blocks = cfg.malloc_num_blocks;
-        mopts.block_size = cfg.malloc_block_size;
-        struct spdk_bdev *mbdev = nullptr;
-        int mrc = create_malloc_disk(&mbdev, &mopts);
-        if (mrc != 0) {
-            LOG(ERROR) << "SpdkEnv: create_malloc_disk failed rc=" << mrc;
-            signal_init_done(env, mrc);
-            return;
-        }
-        LOG(INFO) << "SpdkEnv: created Malloc bdev '" << cfg.bdev_name << "'";
+    struct spdk_bdev_desc *desc = nullptr;
+    int rc = spdk_bdev_open_ext(cfg.bdev_name.c_str(), true,
+                                bdev_event_cb, nullptr, &desc);
+    if (rc != 0) {
+        LOG(ERROR) << "SpdkEnv: spdk_bdev_open_ext('" << cfg.bdev_name
+                   << "') failed rc=" << rc;
+        signal_init_done(env, rc);
+        return;
     }
+    env->bdev_desc_ = desc;
 
-    // Defer bdev open to next reactor poll so io_device registration completes
-    spdk_thread_send_msg(spdk_get_thread(), open_bdev_cb, ctx);
+    struct spdk_bdev *bd = spdk_bdev_desc_get_bdev(desc);
+    env->bdev_ = bd;
+    env->block_size_ = spdk_bdev_get_block_size(bd);
+    env->bdev_size_ =
+        static_cast<uint64_t>(spdk_bdev_get_num_blocks(bd)) * env->block_size_;
+
+    struct spdk_io_channel *ch = spdk_bdev_get_io_channel(desc);
+    if (!ch) {
+        LOG(ERROR) << "SpdkEnv: spdk_bdev_get_io_channel failed";
+        spdk_bdev_close(desc);
+        env->bdev_desc_ = nullptr;
+        signal_init_done(env, -1);
+        return;
+    }
+    env->io_channel_ = ch;
+    env->spdk_thread_ = spdk_get_thread();
+
+    LOG(INFO) << "SpdkEnv: bdev '" << cfg.bdev_name
+              << "' opened — block_size=" << env->block_size_
+              << " total_size=" << env->bdev_size_;
+    signal_init_done(env, 0);
 }
 
 namespace mooncake {
@@ -163,11 +178,40 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
     init_complete_ = false;
     init_result_ = -1;
 
-    reactor_thread_ = std::thread([this]() {
+    std::string json_path;
+    if (config_.use_malloc_bdev) {
+        json_path = "/tmp/mooncake_spdk_bdev.json";
+        FILE *f = fopen(json_path.c_str(), "w");
+        if (f) {
+            fprintf(f,
+                "{\n"
+                "  \"subsystems\": [{\n"
+                "    \"subsystem\": \"bdev\",\n"
+                "    \"config\": [{\n"
+                "      \"method\": \"bdev_malloc_create\",\n"
+                "      \"params\": {\n"
+                "        \"name\": \"%s\",\n"
+                "        \"num_blocks\": %lu,\n"
+                "        \"block_size\": %u\n"
+                "      }\n"
+                "    }]\n"
+                "  }]\n"
+                "}\n",
+                config_.bdev_name.c_str(),
+                config_.malloc_num_blocks,
+                config_.malloc_block_size);
+            fclose(f);
+        }
+    }
+
+    reactor_thread_ = std::thread([this, json_path]() {
         struct spdk_app_opts opts = {};
         spdk_app_opts_init(&opts, sizeof(opts));
         opts.name = config_.name.c_str();
         opts.shutdown_cb = nullptr;
+        if (!json_path.empty()) {
+            opts.json_config_file = json_path.c_str();
+        }
 
         int rc = spdk_app_start(&opts, app_start_cb, this);
         if (rc != 0) {
