@@ -116,12 +116,29 @@ if(USE_SPDK)
     RESULT_VARIABLE SPDK_PC_RC
   )
 
-  # All SPDK libs except test utilities / NVMe (avoids fuse3, CUnit deps).
-  # DPDK libs need --whole-archive for constructor-based driver registration.
-  file(GLOB SPDK_SELECTED_LIBS "${SPDK_DIR}/build/lib/libspdk_*.a")
+  # Explicit SPDK lib whitelist + all DPDK libs.
+  # Both need --whole-archive for constructor-based subsystem/driver registration.
   file(GLOB DPDK_ALL_LIBS "${SPDK_DIR}/dpdk/build/lib/librte_*.a")
-  list(FILTER SPDK_SELECTED_LIBS EXCLUDE REGEX
-    "libspdk_ut\\.a|libspdk_ut_mock|libspdk_keyring|libspdk_nvme\\.a|libspdk_bdev_nvme|libspdk_vmd")
+  set(SPDK_SELECTED_LIBS
+    "${SPDK_DIR}/build/lib/libspdk_event.a"
+    "${SPDK_DIR}/build/lib/libspdk_event_bdev.a"
+    "${SPDK_DIR}/build/lib/libspdk_init.a"
+    "${SPDK_DIR}/build/lib/libspdk_bdev.a"
+    "${SPDK_DIR}/build/lib/libspdk_bdev_malloc.a"
+    "${SPDK_DIR}/build/lib/libspdk_accel.a"
+    "${SPDK_DIR}/build/lib/libspdk_dma.a"
+    "${SPDK_DIR}/build/lib/libspdk_notify.a"
+    "${SPDK_DIR}/build/lib/libspdk_env_dpdk.a"
+    "${SPDK_DIR}/build/lib/libspdk_thread.a"
+    "${SPDK_DIR}/build/lib/libspdk_log.a"
+    "${SPDK_DIR}/build/lib/libspdk_util.a"
+    "${SPDK_DIR}/build/lib/libspdk_json.a"
+    "${SPDK_DIR}/build/lib/libspdk_jsonrpc.a"
+    "${SPDK_DIR}/build/lib/libspdk_rpc.a"
+    "${SPDK_DIR}/build/lib/libspdk_sock.a"
+    "${SPDK_DIR}/build/lib/libspdk_sock_posix.a"
+    "${SPDK_DIR}/build/lib/libspdk_trace.a"
+  )
 
   if(TRUE)
     message(STATUS "SPDK: Using whole-archive DPDK + start-group SPDK linking")
