@@ -224,9 +224,7 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
     spdk_env_opts_init(&opts);
     opts.name = config_.name.c_str();
     opts.shm_id = config_.shm_id;
-    if (opts.mem_size <= 0) {
-        opts.mem_size = 512;
-    }
+    opts.mem_size = -1;
 
     LOG(INFO) << "SpdkEnv: env_opts mem_size=" << opts.mem_size
               << " shm_id=" << opts.shm_id;
