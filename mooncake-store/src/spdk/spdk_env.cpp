@@ -165,7 +165,7 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
 
     reactor_thread_ = std::thread([this]() {
         struct spdk_app_opts opts = {};
-        spdk_app_opts_init(&opts);
+        spdk_app_opts_init(&opts, sizeof(opts));
         opts.name = config_.name.c_str();
         opts.shutdown_cb = nullptr;
 
