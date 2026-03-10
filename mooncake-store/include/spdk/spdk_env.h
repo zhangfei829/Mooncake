@@ -74,6 +74,7 @@ class SpdkEnv {
 
     void ReactorLoop();
     int InitOnSpdkThread();
+    static void CleanupOnSpdkThread(void *ctx);
 
     friend void ::bdev_init_complete_cb(void *, int);
     friend void ::execute_io_cb(void *);
