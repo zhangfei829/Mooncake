@@ -56,38 +56,28 @@ if(USE_SPDK)
   set(_SPDK_INC "${SPDK_DIR}/build/include" "${SPDK_DIR}/include"
                 "${SPDK_DIR}/module" "${SPDK_DIR}/dpdk/build/include")
 
-  file(GLOB _ALL_DPDK_LIBS "${SPDK_DIR}/dpdk/build/lib/librte_*.a")
-  set(_ALL_SPDK_LIBS
-    "${SPDK_DIR}/build/lib/libspdk_event.a"
-    "${SPDK_DIR}/build/lib/libspdk_event_bdev.a"
-    "${SPDK_DIR}/build/lib/libspdk_event_accel.a"
-    "${SPDK_DIR}/build/lib/libspdk_event_sock.a"
-    "${SPDK_DIR}/build/lib/libspdk_event_scheduler.a"
-    "${SPDK_DIR}/build/lib/libspdk_init.a"
-    "${SPDK_DIR}/build/lib/libspdk_keyring.a"
-    "${SPDK_DIR}/build/lib/libspdk_bdev.a"
-    "${SPDK_DIR}/build/lib/libspdk_bdev_malloc.a"
-    "${SPDK_DIR}/build/lib/libspdk_accel.a"
-    "${SPDK_DIR}/build/lib/libspdk_dma.a"
-    "${SPDK_DIR}/build/lib/libspdk_notify.a"
-    "${SPDK_DIR}/build/lib/libspdk_env_dpdk.a"
-    "${SPDK_DIR}/build/lib/libspdk_thread.a"
-    "${SPDK_DIR}/build/lib/libspdk_log.a"
-    "${SPDK_DIR}/build/lib/libspdk_util.a"
-    "${SPDK_DIR}/build/lib/libspdk_json.a"
-    "${SPDK_DIR}/build/lib/libspdk_jsonrpc.a"
-    "${SPDK_DIR}/build/lib/libspdk_rpc.a"
-    "${SPDK_DIR}/build/lib/libspdk_sock.a"
-    "${SPDK_DIR}/build/lib/libspdk_sock_posix.a"
-    "${SPDK_DIR}/build/lib/libspdk_trace.a"
+  set(_SPDK_LIB_NAMES
+    event event_bdev event_accel event_keyring event_iobuf event_sock event_scheduler
+    init bdev bdev_malloc accel dma iobuf
+    keyring keyring_file keyring_linux
+    env_dpdk thread log util json jsonrpc rpc
+    sock sock_posix notify trace
   )
+  set(_ALL_SPDK_LIBS "")
+  foreach(_n ${_SPDK_LIB_NAMES})
+    set(_p "${SPDK_DIR}/build/lib/libspdk_${_n}.a")
+    if(EXISTS "${_p}")
+      list(APPEND _ALL_SPDK_LIBS "${_p}")
+    endif()
+  endforeach()
+  file(GLOB _ALL_DPDK_LIBS "${SPDK_DIR}/dpdk/build/lib/librte_*.a")
 
   add_executable(spdk_minimal_test spdk_minimal_test.cpp)
   target_include_directories(spdk_minimal_test PRIVATE ${_SPDK_INC})
   link_directories("${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/isa-l-crypto/.libs" "${SPDK_DIR}/build/lib")
   target_link_libraries(spdk_minimal_test PRIVATE
     -Wl,--whole-archive ${_ALL_SPDK_LIBS} ${_ALL_DPDK_LIBS} -Wl,--no-whole-archive
-    isal isal_crypto ssl crypto numa dl uuid pthread aio)
+    isal isal_crypto ssl crypto numa dl uuid pthread aio keyutils)
 endif()
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_subdirectory(e2e)
