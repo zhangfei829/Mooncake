@@ -8,11 +8,6 @@
 #include <string>
 #include <thread>
 
-struct spdk_thread;
-struct spdk_bdev;
-struct spdk_bdev_desc;
-struct spdk_io_channel;
-
 namespace mooncake {
 
 struct SpdkEnvConfig {
@@ -72,23 +67,19 @@ class SpdkEnv {
     void ReactorLoop();
     int InitOnSpdkThread();
 
-    static void BdevInitComplete(void *ctx, int rc);
-    static void BdevEventCb(enum spdk_bdev_event_type type,
-                            struct spdk_bdev *bdev, void *ctx);
-    static void ExecuteIoOnSpdkThread(void *ctx);
-    static void IoComplete(struct spdk_bdev_io *bdev_io, bool success,
-                           void *ctx);
-
     std::atomic<bool> initialized_{false};
     std::atomic<bool> should_stop_{false};
     std::atomic<bool> bdev_init_done_{false};
     int bdev_init_rc_ = -1;
 
     std::thread reactor_thread_;
-    struct spdk_thread *spdk_thread_ = nullptr;
-    struct spdk_bdev *bdev_ = nullptr;
-    struct spdk_bdev_desc *bdev_desc_ = nullptr;
-    struct spdk_io_channel *io_channel_ = nullptr;
+
+    // Opaque SPDK handles — stored as void* to avoid leaking C types
+    // into C++ headers. Cast back in the .cpp file.
+    void *spdk_thread_ = nullptr;
+    void *bdev_ = nullptr;
+    void *bdev_desc_ = nullptr;
+    void *io_channel_ = nullptr;
 
     uint32_t block_size_ = 0;
     uint64_t bdev_size_ = 0;
