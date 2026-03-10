@@ -48,6 +48,26 @@ add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(spdk_test spdk_test.cpp)
+
+if(USE_SPDK)
+  if(NOT SPDK_DIR)
+    set(SPDK_DIR "${CMAKE_SOURCE_DIR}/spdk")
+  endif()
+  set(_SPDK_INC "${SPDK_DIR}/build/include" "${SPDK_DIR}/include"
+                "${SPDK_DIR}/module" "${SPDK_DIR}/dpdk/build/include")
+  set(ENV{PKG_CONFIG_PATH}
+    "${SPDK_DIR}/build/lib/pkgconfig:${SPDK_DIR}/dpdk/build/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+  execute_process(
+    COMMAND pkg-config --libs --static spdk_event spdk_event_bdev spdk_bdev spdk_bdev_malloc spdk_env_dpdk
+    OUTPUT_VARIABLE _SPDK_LIBS OUTPUT_STRIP_TRAILING_WHITESPACE)
+  separate_arguments(_SPDK_LIBS_LIST UNIX_COMMAND "${_SPDK_LIBS}")
+
+  add_executable(spdk_minimal_test spdk_minimal_test.cpp)
+  target_include_directories(spdk_minimal_test PRIVATE ${_SPDK_INC})
+  link_directories("${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/build/lib")
+  target_link_libraries(spdk_minimal_test PRIVATE
+    ${_SPDK_LIBS_LIST} isal ssl crypto numa dl uuid pthread aio)
+endif()
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_subdirectory(e2e)
 
