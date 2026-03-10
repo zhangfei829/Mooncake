@@ -67,7 +67,7 @@ void execute_io_cb(void *ctx) {
 // spdk_app_start callback — runs on the SPDK reactor thread.
 // Opens bdev, gets io_channel, signals the main thread.
 // ---------------------------------------------------------------------------
-static void app_start_cb(void *ctx) {
+void app_start_cb(void *ctx) {
     auto *env = static_cast<mooncake::SpdkEnv *>(ctx);
     auto &cfg = env->config_;
 
