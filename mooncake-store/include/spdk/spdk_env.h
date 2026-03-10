@@ -8,6 +8,9 @@
 #include <string>
 #include <thread>
 
+void bdev_init_complete_cb(void *ctx, int rc);
+void execute_io_cb(void *ctx);
+
 namespace mooncake {
 
 struct SpdkEnvConfig {
@@ -66,6 +69,9 @@ class SpdkEnv {
 
     void ReactorLoop();
     int InitOnSpdkThread();
+
+    friend void ::bdev_init_complete_cb(void *, int);
+    friend void ::execute_io_cb(void *);
 
     std::atomic<bool> initialized_{false};
     std::atomic<bool> should_stop_{false};
