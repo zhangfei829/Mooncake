@@ -67,8 +67,7 @@ if(USE_SPDK)
   target_include_directories(spdk_minimal_test PRIVATE ${_SPDK_INC})
   link_directories("${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/isa-l-crypto/.libs" "${SPDK_DIR}/build/lib")
   target_link_libraries(spdk_minimal_test PRIVATE
-    -Wl,--start-group ${_ALL_SPDK_LIBS} -Wl,--end-group
-    -Wl,--whole-archive ${_ALL_DPDK_LIBS} -Wl,--no-whole-archive
+    -Wl,--whole-archive ${_ALL_SPDK_LIBS} ${_ALL_DPDK_LIBS} -Wl,--no-whole-archive
     isal isal_crypto ssl crypto numa dl uuid pthread aio)
 endif()
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)

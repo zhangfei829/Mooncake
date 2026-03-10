@@ -130,8 +130,7 @@ if(USE_SPDK)
     list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_SOURCES})
     link_directories("${SPDK_DIR}/isa-l/.libs" "${SPDK_DIR}/isa-l-crypto/.libs" "${SPDK_DIR}/build/lib")
     list(APPEND EXTRA_LIBS
-      -Wl,--start-group ${SPDK_SELECTED_LIBS} -Wl,--end-group
-      -Wl,--whole-archive ${DPDK_ALL_LIBS} -Wl,--no-whole-archive
+      -Wl,--whole-archive ${SPDK_SELECTED_LIBS} ${DPDK_ALL_LIBS} -Wl,--no-whole-archive
       isal isal_crypto ssl crypto numa dl uuid pthread aio)
   else()
     message(STATUS "SPDK: pkg-config unavailable, falling back to manual linking")
