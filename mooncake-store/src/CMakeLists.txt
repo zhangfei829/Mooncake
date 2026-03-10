@@ -110,7 +110,7 @@ if(USE_SPDK)
   set(ENV{PKG_CONFIG_PATH} "${SPDK_PC_PATH}:$ENV{PKG_CONFIG_PATH}")
 
   execute_process(
-    COMMAND pkg-config --libs --static spdk_bdev spdk_bdev_malloc spdk_env_dpdk
+    COMMAND pkg-config --libs --static spdk_event spdk_event_bdev spdk_bdev spdk_bdev_malloc spdk_env_dpdk
     OUTPUT_VARIABLE SPDK_LDFLAGS
     OUTPUT_STRIP_TRAILING_WHITESPACE
     RESULT_VARIABLE SPDK_PC_RC
