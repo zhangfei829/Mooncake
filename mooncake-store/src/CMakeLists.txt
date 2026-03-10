@@ -122,6 +122,8 @@ if(USE_SPDK)
   set(SPDK_SELECTED_LIBS
     "${SPDK_DIR}/build/lib/libspdk_event.a"
     "${SPDK_DIR}/build/lib/libspdk_event_bdev.a"
+    "${SPDK_DIR}/build/lib/libspdk_event_accel.a"
+    "${SPDK_DIR}/build/lib/libspdk_event_sock.a"
     "${SPDK_DIR}/build/lib/libspdk_init.a"
     "${SPDK_DIR}/build/lib/libspdk_bdev.a"
     "${SPDK_DIR}/build/lib/libspdk_bdev_malloc.a"
