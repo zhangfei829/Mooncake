@@ -67,7 +67,7 @@ void execute_io_cb(void *ctx) {
 // spdk_app_start callback — runs on the SPDK reactor thread.
 // Opens bdev, gets io_channel, signals the main thread.
 // ---------------------------------------------------------------------------
-static void signal_init_done(mooncake::SpdkEnv *env, int rc) {
+void signal_init_done(mooncake::SpdkEnv *env, int rc) {
     env->init_result_ = rc;
     {
         std::lock_guard<std::mutex> lk(env->init_mutex_);
@@ -77,7 +77,7 @@ static void signal_init_done(mooncake::SpdkEnv *env, int rc) {
     if (rc != 0) spdk_app_stop(-1);
 }
 
-static void open_bdev_cb(void *ctx) {
+void open_bdev_cb(void *ctx) {
     auto *env = static_cast<mooncake::SpdkEnv *>(ctx);
     auto &cfg = env->config_;
 
