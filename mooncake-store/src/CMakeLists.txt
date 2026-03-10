@@ -123,7 +123,9 @@ if(USE_SPDK)
 
   add_subdirectory(spdk)
   list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_SOURCES})
-  list(APPEND EXTRA_LIBS ${SPDK_FOUND_LIBS} numa dl uuid pthread ssl crypto)
+  list(APPEND EXTRA_LIBS
+    -Wl,--whole-archive ${SPDK_FOUND_LIBS} -Wl,--no-whole-archive
+    numa dl uuid pthread ssl crypto aio)
   message(STATUS "SPDK: Enabled for mooncake_store (SPDK_DIR=${SPDK_DIR})")
 endif()
 
