@@ -10,6 +10,7 @@
 
 void bdev_init_complete_cb(void *ctx, int rc);
 void execute_io_cb(void *ctx);
+void app_start_cb(void *ctx);
 
 namespace mooncake {
 
@@ -72,6 +73,7 @@ class SpdkEnv {
 
     friend void ::bdev_init_complete_cb(void *, int);
     friend void ::execute_io_cb(void *);
+    friend void ::app_start_cb(void *);
 
     std::atomic<bool> initialized_{false};
     std::atomic<bool> should_stop_{false};
