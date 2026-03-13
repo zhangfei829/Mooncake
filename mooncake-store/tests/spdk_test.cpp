@@ -19,28 +19,30 @@
 
 namespace mooncake::test {
 
-static mooncake::SpdkEnvConfig MakeTestConfig() {
-    mooncake::SpdkEnvConfig cfg;
-    cfg.bdev_name = "TestMalloc0";
-    cfg.use_malloc_bdev = true;
-    cfg.malloc_num_blocks = 32768;  // 128 MB with 4K blocks
-    cfg.malloc_block_size = 4096;
-    return cfg;
-}
+// Global SPDK environment — initialized once, shared by all tests.
+// DPDK cannot be re-initialized within the same process.
+class SpdkTestEnv : public ::testing::Environment {
+   public:
+    void SetUp() override {
+        SpdkEnvConfig cfg;
+        cfg.bdev_name = "TestMalloc0";
+        cfg.use_malloc_bdev = true;
+        cfg.malloc_num_blocks = 32768;  // 128 MB
+        cfg.malloc_block_size = 4096;
+        int rc = SpdkEnv::Instance().Init(cfg);
+        ASSERT_EQ(rc, 0) << "SpdkEnv global init failed";
+    }
+    void TearDown() override { SpdkEnv::Instance().Shutdown(); }
+};
+
+static auto *g_spdk_env [[maybe_unused]] =
+    ::testing::AddGlobalTestEnvironment(new SpdkTestEnv);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Step 1: SpdkEnv init / shutdown
 // ═══════════════════════════════════════════════════════════════════════════
 
-class SpdkEnvTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
-        auto cfg = MakeTestConfig();
-        int rc = SpdkEnv::Instance().Init(cfg);
-        ASSERT_EQ(rc, 0) << "SpdkEnv::Init failed";
-    }
-    void TearDown() override { SpdkEnv::Instance().Shutdown(); }
-};
+class SpdkEnvTest : public ::testing::Test {};
 
 TEST_F(SpdkEnvTest, InitAndShutdown) {
     EXPECT_TRUE(SpdkEnv::Instance().IsInitialized());
@@ -94,15 +96,7 @@ TEST_F(SpdkEnvTest, RawReadWrite) {
 // Step 2: SpdkFile read / write / vector_write / vector_read
 // ═══════════════════════════════════════════════════════════════════════════
 
-class SpdkFileTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
-        auto cfg = MakeTestConfig();
-        int rc = SpdkEnv::Instance().Init(cfg);
-        ASSERT_EQ(rc, 0);
-    }
-    void TearDown() override { SpdkEnv::Instance().Shutdown(); }
-};
+class SpdkFileTest : public ::testing::Test {};
 
 TEST_F(SpdkFileTest, SequentialWriteRead) {
     SpdkFile file("test_seq", 0, 1024 * 1024);
@@ -177,7 +171,6 @@ class SpdkStorageBackendTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        SpdkEnv::Instance().Shutdown();
         std::filesystem::remove_all(data_path);
     }
 };
