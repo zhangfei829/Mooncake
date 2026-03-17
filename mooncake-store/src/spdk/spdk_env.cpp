@@ -40,6 +40,16 @@ static void submit_single_io(mooncake::SpdkIoRequest *req, void *bdev_desc) {
         auto *r = static_cast<mooncake::SpdkIoRequest *>(arg);
         spdk_bdev_free_io(bio);
         r->success = ok;
+        if (ok && r->op == mooncake::SpdkIoRequest::READ &&
+            r->dst_iov && r->dst_iovcnt > 0) {
+            const char *src =
+                static_cast<const char *>(r->buf) + r->dst_skip;
+            for (int i = 0; i < r->dst_iovcnt; ++i) {
+                std::memcpy(r->dst_iov[i].iov_base, src,
+                            r->dst_iov[i].iov_len);
+                src += r->dst_iov[i].iov_len;
+            }
+        }
         r->completed.store(true, std::memory_order_release);
     };
 

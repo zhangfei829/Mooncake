@@ -53,6 +53,10 @@ struct SpdkIoRequest {
     const struct iovec *src_iov = nullptr;
     int src_iovcnt = 0;
 
+    const struct iovec *dst_iov = nullptr;
+    int dst_iovcnt = 0;
+    size_t dst_skip = 0;
+
     SpdkIoRequest *_next_batch = nullptr;
 };
 
