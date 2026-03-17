@@ -1114,11 +1114,6 @@ static void RunBackendBench() {
         8 * 1024 * 1024, 2 * 1024 * 1024, 512 * 1024,
         128 * 1024,      32 * 1024,      4096};
 
-    // No pre-warm for the sweep: each value size naturally fills the pool via
-    // the write phase, and the read phase reuses those buffers. Large sizes
-    // have few keys (small pipeline QD), so DMA memory stays bounded.
-    // Pre-warming with large buffers would exhaust hugepages.
-
     for (size_t vsz : value_sizes) {
         uint64_t bdev_cap = env.GetBdevSize();
         size_t per_key_overhead = vsz + 4096 + 64;
@@ -1152,6 +1147,14 @@ static void RunBackendBench() {
             fs::remove_all(posix_dir);
         }
 
+        // Pre-warm DMA pool for this specific value size.
+        // Allocate exactly pipeline-QD buffers so spdk_dma_malloc cost
+        // is excluded from the timed benchmark, then drain after.
+        int sweep_qd = std::min(static_cast<int>(effective_keys), 128);
+        size_t warm_size = spdk_align_up(vsz + 4096 + 64);
+        env.DmaPoolDrain();
+        env.DmaPoolPrewarm(warm_size, sweep_qd, env.GetBlockSize());
+
         // SPDK
         {
             fs::create_directories(spdk_dir);
@@ -1173,8 +1176,6 @@ static void RunBackendBench() {
             }
             fs::remove_all(spdk_dir);
         }
-        // Release DMA buffers accumulated during this value-size test
-        // to avoid exhausting hugepages across the sweep.
         env.DmaPoolDrain();
 
         char row[300];
