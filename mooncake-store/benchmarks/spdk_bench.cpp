@@ -416,6 +416,7 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
     auto wall_t1 = Clock::now();
     result.total_secs =
         std::chrono::duration<double>(wall_t1 - wall_t0).count();
+    result.latency.Sort();
 
     for (int i = 0; i < iodepth; ++i)
         if (dma_bufs[i]) env.DmaFree(dma_bufs[i]);
@@ -522,6 +523,7 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
     auto wall_t1 = Clock::now();
     result.total_secs =
         std::chrono::duration<double>(wall_t1 - wall_t0).count();
+    result.latency.Sort();
 
     for (int i = 0; i < iodepth; ++i)
         if (dma_bufs[i]) env.DmaFree(dma_bufs[i]);
