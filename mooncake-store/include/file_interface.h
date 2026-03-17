@@ -142,6 +142,22 @@ class StorageFile {
         return {};
     }
 
+    struct BatchWriteEntry {
+        const iovec *iov;
+        int iovcnt;
+        off_t offset;
+    };
+
+    virtual tl::expected<void, ErrorCode> vector_write_batch(
+        const BatchWriteEntry *entries, int count) {
+        for (int i = 0; i < count; ++i) {
+            auto r = vector_write(entries[i].iov, entries[i].iovcnt,
+                                  entries[i].offset);
+            if (!r) return tl::make_unexpected(r.error());
+        }
+        return {};
+    }
+
     template <typename T>
     tl::expected<T, ErrorCode> make_error(ErrorCode code) {
         error_code_ = code;
@@ -288,6 +304,8 @@ class SpdkFile : public StorageFile {
 
     tl::expected<void, ErrorCode> vector_read_batch(
         const BatchReadEntry *entries, int count) override;
+    tl::expected<void, ErrorCode> vector_write_batch(
+        const BatchWriteEntry *entries, int count) override;
 
    private:
     static constexpr size_t BLOCK_ALIGN = 4096;
@@ -299,9 +317,6 @@ class SpdkFile : public StorageFile {
     void *AcquireDmaBuf(size_t needed);
     void ReleaseDmaBuf(void *buf, size_t size);
 
-    void *DmaPoolAlloc(size_t needed);
-    void DmaPoolFree(void *buf, size_t size);
-
     uint64_t base_offset_;
     uint64_t current_offset_;
     uint64_t max_size_;
@@ -309,9 +324,6 @@ class SpdkFile : public StorageFile {
 
     void *cached_dma_buf_{nullptr};
     size_t cached_dma_size_{0};
-
-    struct DmaPoolEntry { void *buf; size_t size; };
-    std::vector<DmaPoolEntry> dma_pool_;
 };
 #endif  // USE_SPDK
 

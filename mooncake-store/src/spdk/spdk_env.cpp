@@ -403,6 +403,13 @@ void SpdkEnv::Shutdown() {
     }
 
     if (reactor_thread_.joinable()) reactor_thread_.join();
+
+    {
+        std::lock_guard<std::mutex> lk(dma_pool_mutex_);
+        for (auto &e : dma_pool_) spdk_dma_free(e.buf);
+        dma_pool_.clear();
+    }
+
     LOG(INFO) << "SpdkEnv: shutdown complete";
 }
 
@@ -493,5 +500,35 @@ void *SpdkEnv::DmaMalloc(size_t size, size_t align) {
 }
 
 void SpdkEnv::DmaFree(void *buf) { spdk_dma_free(buf); }
+
+// ---------------------------------------------------------------------------
+// DMA buffer pool — avoids spdk_dma_malloc/free in hot path.
+// Buffers persist across SpdkFile lifetimes (global singleton pool).
+// ---------------------------------------------------------------------------
+void *SpdkEnv::DmaPoolAlloc(size_t needed, size_t align) {
+    {
+        std::lock_guard<std::mutex> lk(dma_pool_mutex_);
+        int best = -1;
+        size_t best_size = SIZE_MAX;
+        for (int i = 0; i < static_cast<int>(dma_pool_.size()); ++i) {
+            if (dma_pool_[i].size >= needed && dma_pool_[i].size < best_size) {
+                best = i;
+                best_size = dma_pool_[i].size;
+            }
+        }
+        if (best >= 0) {
+            void *buf = dma_pool_[best].buf;
+            dma_pool_[best] = dma_pool_.back();
+            dma_pool_.pop_back();
+            return buf;
+        }
+    }
+    return spdk_dma_malloc(needed, align, nullptr);
+}
+
+void SpdkEnv::DmaPoolFree(void *buf, size_t size) {
+    std::lock_guard<std::mutex> lk(dma_pool_mutex_);
+    dma_pool_.push_back({buf, size});
+}
 
 }  // namespace mooncake

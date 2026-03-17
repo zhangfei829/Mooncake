@@ -28,9 +28,6 @@ SpdkFile::~SpdkFile() {
         cached_dma_buf_ = nullptr;
         cached_dma_size_ = 0;
     }
-    auto &env = SpdkEnv::Instance();
-    for (auto &e : dma_pool_) env.DmaFree(e.buf);
-    dma_pool_.clear();
     fd_ = -1;
 }
 
@@ -52,30 +49,6 @@ void *SpdkFile::AcquireDmaBuf(size_t needed) {
 
 void ReleaseDmaBuf(void *, size_t) {
     // No-op: buffer stays cached for reuse, freed in destructor
-}
-
-// Pool for batch reads — avoids spdk_dma_malloc/free in hot path.
-// Returns the best-fit buffer from pool; falls back to DmaMalloc.
-void *SpdkFile::DmaPoolAlloc(size_t needed) {
-    int best = -1;
-    size_t best_size = SIZE_MAX;
-    for (int i = 0; i < static_cast<int>(dma_pool_.size()); ++i) {
-        if (dma_pool_[i].size >= needed && dma_pool_[i].size < best_size) {
-            best = i;
-            best_size = dma_pool_[i].size;
-        }
-    }
-    if (best >= 0) {
-        void *buf = dma_pool_[best].buf;
-        dma_pool_[best] = dma_pool_.back();
-        dma_pool_.pop_back();
-        return buf;
-    }
-    return SpdkEnv::Instance().DmaMalloc(needed, block_size_);
-}
-
-void SpdkFile::DmaPoolFree(void *buf, size_t size) {
-    dma_pool_.push_back({buf, size});
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +224,81 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_read(const iovec *iov,
 }
 
 // ---------------------------------------------------------------------------
+// Batch pipelined write — submit all writes via SubmitIoBatchAsync, wait all.
+// ---------------------------------------------------------------------------
+tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
+    const BatchWriteEntry *entries, int count) {
+    if (error_code_ != ErrorCode::OK) {
+        return tl::make_unexpected(error_code_);
+    }
+    if (count <= 0) return {};
+
+    auto &env = SpdkEnv::Instance();
+
+    struct WriteCtx {
+        void *dma_buf;
+        size_t alloc_len;
+    };
+
+    auto ctxs = std::make_unique<WriteCtx[]>(count);
+    auto reqs = std::make_unique<SpdkIoRequest[]>(count);
+    auto ptrs = std::make_unique<SpdkIoRequest *[]>(count);
+
+    for (int i = 0; i < count; ++i) {
+        size_t total = 0;
+        for (int j = 0; j < entries[i].iovcnt; ++j)
+            total += entries[i].iov[j].iov_len;
+
+        uint64_t abs_off =
+            base_offset_ + static_cast<uint64_t>(entries[i].offset);
+        size_t aligned_off =
+            abs_off & ~(static_cast<size_t>(block_size_) - 1);
+        size_t aligned_len = align_up(total);
+
+        void *dma_buf = env.DmaPoolAlloc(aligned_len, block_size_);
+        if (!dma_buf) {
+            for (int j = 0; j < i; ++j)
+                env.DmaPoolFree(ctxs[j].dma_buf, ctxs[j].alloc_len);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        ctxs[i] = {dma_buf, aligned_len};
+        reqs[i].op = SpdkIoRequest::WRITE;
+        reqs[i].buf = dma_buf;
+        reqs[i].offset = aligned_off;
+        reqs[i].nbytes = aligned_len;
+        reqs[i].src_iov = entries[i].iov;
+        reqs[i].src_iovcnt = entries[i].iovcnt;
+        reqs[i].src_data = nullptr;
+        reqs[i].src_len = 0;
+        reqs[i].dst_iov = nullptr;
+        reqs[i].dst_iovcnt = 0;
+        ptrs[i] = &reqs[i];
+    }
+
+    env.SubmitIoBatchAsync(ptrs.get(), count);
+
+    for (int i = 0; i < count; ++i) {
+        while (!reqs[i].completed.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#else
+            std::this_thread::yield();
+#endif
+        }
+    }
+
+    for (int i = 0; i < count; ++i)
+        env.DmaPoolFree(ctxs[i].dma_buf, ctxs[i].alloc_len);
+
+    for (int i = 0; i < count; ++i) {
+        if (!reqs[i].success)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
 // Batch pipelined read — submit all reads via SubmitIoBatchAsync, wait all.
 // ---------------------------------------------------------------------------
 tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
@@ -284,9 +332,9 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         size_t skip = abs_off - aligned_off;
         size_t aligned_len = align_up(total + skip);
 
-        void *dma_buf = DmaPoolAlloc(aligned_len);
+        void *dma_buf = env.DmaPoolAlloc(aligned_len, block_size_);
         if (!dma_buf) {
-            for (int j = 0; j < i; ++j) DmaPoolFree(ctxs[j].dma_buf, ctxs[j].alloc_len);
+            for (int j = 0; j < i; ++j) env.DmaPoolFree(ctxs[j].dma_buf, ctxs[j].alloc_len);
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
 
@@ -316,7 +364,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         }
     }
 
-    for (int i = 0; i < count; ++i) DmaPoolFree(ctxs[i].dma_buf, ctxs[i].alloc_len);
+    for (int i = 0; i < count; ++i) env.DmaPoolFree(ctxs[i].dma_buf, ctxs[i].alloc_len);
 
     for (int i = 0; i < count; ++i) {
         if (!reqs[i].success)

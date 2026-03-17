@@ -521,39 +521,50 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
         FillPattern(values[i].data(), value_size, static_cast<uint32_t>(i));
     }
 
-    // --- Offload (write) ---
+    // --- Offload (write) — batch ALL keys per thread ---
     size_t keys_per_thread = num_keys / threads;
     std::vector<LatencyStats> w_latencies(threads);
     std::vector<int64_t> w_counts(threads, 0);
+
+    // Pre-build per-thread batch maps OUTSIDE the timer
+    struct ThreadWriteCtx {
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        size_t start, count;
+    };
+    std::vector<ThreadWriteCtx> w_ctxs(threads);
+    for (int t = 0; t < threads; ++t) {
+        size_t start = t * keys_per_thread;
+        size_t end =
+            (t == threads - 1) ? num_keys : start + keys_per_thread;
+        size_t count = end - start;
+        w_ctxs[t].start = start;
+        w_ctxs[t].count = count;
+        w_ctxs[t].batch.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            w_ctxs[t].batch.emplace(
+                keys[start + i],
+                std::vector<Slice>{
+                    Slice{const_cast<char *>(values[start + i].data()),
+                          values[start + i].size()}});
+        }
+    }
 
     auto offload_total_t0 = Clock::now();
     {
         std::vector<std::thread> pool;
         for (int t = 0; t < threads; ++t) {
             pool.emplace_back([&, t]() {
-                size_t start = t * keys_per_thread;
-                size_t end =
-                    (t == threads - 1) ? num_keys : start + keys_per_thread;
+                auto &ctx = w_ctxs[t];
+                auto t0 = Clock::now();
+                auto res = be.BatchOffload(ctx.batch, no_op_handler);
+                auto t1 = Clock::now();
 
-                for (size_t i = start; i < end; ++i) {
-                    std::unordered_map<std::string, std::vector<Slice>> batch;
-                    batch.emplace(
-                        keys[i],
-                        std::vector<Slice>{
-                            Slice{const_cast<char *>(values[i].data()),
-                                  values[i].size()}});
-
-                    auto t0 = Clock::now();
-                    auto res = be.BatchOffload(batch, no_op_handler);
-                    auto t1 = Clock::now();
-
-                    if (res.has_value()) {
-                        w_counts[t] += res.value();
-                        double us = std::chrono::duration<double, std::micro>(
-                                        t1 - t0)
-                                        .count();
-                        w_latencies[t].Add(us);
-                    }
+                if (res.has_value()) {
+                    w_counts[t] = res.value();
+                    double us = std::chrono::duration<double, std::micro>(
+                                    t1 - t0)
+                                    .count();
+                    w_latencies[t].Add(us);
                 }
             });
         }
@@ -579,27 +590,42 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
     // --- Load (read) — batch ALL keys per thread to exploit SPDK multi-core ---
     std::vector<LatencyStats> r_latencies(threads);
 
+    // Pre-allocate read destination buffers OUTSIDE the timer
+    struct ThreadReadCtx {
+        std::unique_ptr<std::unique_ptr<char[]>[]> rbufs;
+        std::unordered_map<std::string, Slice> slices;
+        size_t start, count;
+    };
+    std::vector<ThreadReadCtx> thread_ctxs(threads);
+    for (int t = 0; t < threads; ++t) {
+        size_t start = t * keys_per_thread;
+        size_t end =
+            (t == threads - 1) ? num_keys : start + keys_per_thread;
+        size_t count = end - start;
+
+        thread_ctxs[t].start = start;
+        thread_ctxs[t].count = count;
+        thread_ctxs[t].rbufs =
+            std::make_unique<std::unique_ptr<char[]>[]>(count);
+        thread_ctxs[t].slices.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            thread_ctxs[t].rbufs[i] =
+                std::make_unique<char[]>(value_size);
+            thread_ctxs[t].slices.emplace(
+                keys[start + i],
+                Slice{thread_ctxs[t].rbufs[i].get(), value_size});
+        }
+    }
+
     auto load_total_t0 = Clock::now();
     {
         std::vector<std::thread> pool;
         for (int t = 0; t < threads; ++t) {
             pool.emplace_back([&, t]() {
-                size_t start = t * keys_per_thread;
-                size_t end =
-                    (t == threads - 1) ? num_keys : start + keys_per_thread;
-
-                size_t count = end - start;
-                auto rbufs = std::make_unique<std::unique_ptr<char[]>[]>(count);
-                std::unordered_map<std::string, Slice> slices;
-                slices.reserve(count);
-                for (size_t i = 0; i < count; ++i) {
-                    rbufs[i] = std::make_unique<char[]>(value_size);
-                    slices.emplace(keys[start + i],
-                                   Slice{rbufs[i].get(), value_size});
-                }
+                auto &ctx = thread_ctxs[t];
 
                 auto t0 = Clock::now();
-                auto res = be.BatchLoad(slices);
+                auto res = be.BatchLoad(ctx.slices);
                 auto t1 = Clock::now();
 
                 double us =
@@ -607,13 +633,13 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
                 r_latencies[t].Add(us);
 
                 if (do_verify && res.has_value()) {
-                    for (size_t i = 0; i < count; ++i) {
-                        if (std::memcmp(rbufs[i].get(),
-                                        values[start + i].data(),
+                    for (size_t i = 0; i < ctx.count; ++i) {
+                        if (std::memcmp(ctx.rbufs[i].get(),
+                                        values[ctx.start + i].data(),
                                         value_size) != 0) {
                             LOG(ERROR)
                                 << "Backend verify FAILED for "
-                                << keys[start + i];
+                                << keys[ctx.start + i];
                         }
                     }
                 }

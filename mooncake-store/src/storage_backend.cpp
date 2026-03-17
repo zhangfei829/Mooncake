@@ -2586,134 +2586,122 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
-    // Process each object in the batch; continue on individual failures to
-    // support partial success
-    for (const auto& [key, slices] : batch_object) {
-        if (slices.empty()) {
-            // Skip empty slices (empty values are allowed but not stored)
-            continue;
-        }
+    // ---- Phase 1a: Prepare all writes (allocate offsets) ----
+    struct WritePlan {
+        std::string key;
+        RecordHeader header;
+        uint64_t offset;
+        size_t record_size;
+        uint32_t value_size;
+        std::vector<iovec> iovs;
+        const std::vector<Slice>* slices_ptr;
+        decltype(allocator_->allocate(0))::value_type allocation;
+    };
 
-        // Test-only: Check if this key should fail (deterministic failure
-        // injection)
+    std::vector<WritePlan> write_plans;
+    write_plans.reserve(batch_object.size());
+
+    for (const auto& [key, slices] : batch_object) {
+        if (slices.empty()) continue;
+
         if (test_failure_predicate_ && test_failure_predicate_(key)) {
             LOG(INFO) << "[TEST] Injecting failure for key: " << key
                       << " (test failure predicate)";
-            continue;  // Simulate allocation/write failure
+            continue;
         }
 
-        // Calculate total value size
         uint32_t value_size = 0;
-        for (const auto& slice : slices) {
+        for (const auto& slice : slices)
             value_size += static_cast<uint32_t>(slice.size);
-        }
 
-        // Prepare record header
         RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
                             .value_len = value_size};
-
-        // Use size_t for record_size to handle large objects (up to 4GB per
-        // RecordHeader)
         size_t record_size =
             RecordHeader::SIZE + header.key_len + header.value_len;
 
-        // Step 1: Allocate space (allocator is thread-safe, ensures unique
-        // offsets) No locks held during allocation
         auto allocation = allocator_->allocate(record_size);
         if (!allocation.has_value()) {
             LOG(ERROR) << "Failed to allocate " << record_size
                        << " bytes for key: " << key
                        << " - stopping processing for this batch";
-            break;  // Stop processing other keys as space is likely exhausted
+            break;
         }
 
-        uint64_t offset = allocation->address();
+        WritePlan plan;
+        plan.key = key;
+        plan.header = header;
+        plan.offset = allocation->address();
+        plan.record_size = record_size;
+        plan.value_size = value_size;
+        plan.allocation = std::move(allocation.value());
+        plan.slices_ptr = &slices;
+        write_plans.push_back(std::move(plan));
+    }
 
-        // Step 2: Write data to disk (no metadata locks held during I/O)
-        std::vector<iovec> iovs;
-        iovs.reserve(2 + slices.size());
+    // ---- Phase 1b: Build iovecs (plans are in final vector positions) ----
+    for (auto& plan : write_plans) {
+        plan.iovs.reserve(3 + plan.slices_ptr->size());
+        plan.iovs.push_back(
+            {reinterpret_cast<char*>(&plan.header.key_len),
+             sizeof(plan.header.key_len)});
+        plan.iovs.push_back(
+            {reinterpret_cast<char*>(&plan.header.value_len),
+             sizeof(plan.header.value_len)});
+        plan.iovs.push_back({const_cast<char*>(plan.key.data()),
+                             static_cast<size_t>(plan.header.key_len)});
+        for (const auto& slice : *plan.slices_ptr)
+            plan.iovs.push_back({slice.ptr, slice.size});
+    }
 
-        // Header
-        iovs.push_back(
-            {const_cast<char*>(reinterpret_cast<const char*>(&header.key_len)),
-             sizeof(header.key_len)});
-        iovs.push_back({const_cast<char*>(
-                            reinterpret_cast<const char*>(&header.value_len)),
-                        sizeof(header.value_len)});
-
-        // Key
-        iovs.push_back({const_cast<char*>(key.data()),
-                        static_cast<size_t>(header.key_len)});
-
-        // Value slices
-        for (const auto& slice : slices) {
-            iovs.push_back({slice.ptr, slice.size});
+    // ---- Phase 2: Batch I/O — submit all writes at once ----
+    if (!write_plans.empty()) {
+        const size_t n = write_plans.size();
+        std::vector<StorageFile::BatchWriteEntry> entries(n);
+        for (size_t i = 0; i < n; ++i) {
+            entries[i] = {write_plans[i].iovs.data(),
+                          static_cast<int>(write_plans[i].iovs.size()),
+                          static_cast<off_t>(write_plans[i].offset)};
         }
 
-        auto write_result =
-            data_file_->vector_write(iovs.data(), iovs.size(), offset);
-        if (!write_result) {
-            LOG(ERROR) << "Failed to write record for key: " << key
-                       << ", error: " << write_result.error()
-                       << " - continuing with remaining keys";
-            // Allocation handle is still local (not yet stored in the metadata
-            // map) and will be freed automatically when going out of scope.
-            continue;  // Continue processing other keys
+        auto batch_result = data_file_->vector_write_batch(
+            entries.data(), static_cast<int>(n));
+        if (!batch_result) {
+            LOG(ERROR) << "Batch write failed: " << batch_result.error();
+            return tl::make_unexpected(batch_result.error());
         }
+    }
 
-        // Handle the case where the data was written partially.
-        size_t written = write_result.value();
-        if (written != record_size) {
-            LOG(ERROR) << "Write size mismatch for key: " << key
-                       << ", expected: " << record_size << ", got: " << written
-                       << " - continuing with remaining keys";
-            continue;  // Continue processing other keys
-        }
-
-        // Step 3: Wrap allocation in refcounted handle
+    // ---- Phase 3: Update metadata for all successful writes ----
+    for (auto& plan : write_plans) {
         auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
-            std::move(allocation.value()));
+            std::move(plan.allocation));
 
-        // Step 4: Update metadata map under exclusive shard lock
-        // Lock only the shard for this key (other shards can proceed in
-        // parallel)
-        {
-            size_t shard_idx = ShardForKey(key);
-            auto& shard = shards_[shard_idx];
-            SharedMutexLocker lock(&shard.mutex);
+        size_t shard_idx = ShardForKey(plan.key);
+        auto& shard = shards_[shard_idx];
+        SharedMutexLocker lock(&shard.mutex);
 
-            // Check if key exists to update size accounting
-            auto it = shard.map.find(key);
-            int64_t size_delta = static_cast<int64_t>(record_size);
-            bool is_new_key = (it == shard.map.end());
+        auto it = shard.map.find(plan.key);
+        int64_t size_delta = static_cast<int64_t>(plan.record_size);
+        bool is_new_key = (it == shard.map.end());
 
-            if (!is_new_key) {
-                // Overwrite: subtract old size
-                size_delta -= static_cast<int64_t>(it->second.total_size);
-                // Old AllocationPtr will be dropped, refcount decremented
-                // Physical extent freed when last reader releases it
-            }
-
-            // Update map (insert_or_assign handles both insert and overwrite)
-            shard.map.insert_or_assign(
-                key, ObjectEntry(offset, record_size, value_size,
-                                 std::move(allocation_ptr)));
-
-            // Update total size atomically (lock-free, separate from map
-            // updates)
-            total_size_.fetch_add(size_delta, std::memory_order_relaxed);
-
-            // Update total keys only if inserting a new key
-            if (is_new_key) {
-                total_keys_.fetch_add(1, std::memory_order_relaxed);
-            }
+        if (!is_new_key) {
+            size_delta -= static_cast<int64_t>(it->second.total_size);
         }
 
-        keys.push_back(key);
+        shard.map.insert_or_assign(
+            plan.key,
+            ObjectEntry(plan.offset, plan.record_size, plan.value_size,
+                        std::move(allocation_ptr)));
+
+        total_size_.fetch_add(size_delta, std::memory_order_relaxed);
+        if (is_new_key)
+            total_keys_.fetch_add(1, std::memory_order_relaxed);
+
+        keys.push_back(plan.key);
         metadatas.push_back(StorageObjectMetadata{
-            0,  // bucket_id not used for this backend
-            static_cast<int64_t>(offset), static_cast<int64_t>(header.key_len),
-            static_cast<int64_t>(value_size), ""});
+            0, static_cast<int64_t>(plan.offset),
+            static_cast<int64_t>(plan.header.key_len),
+            static_cast<int64_t>(plan.value_size), ""});
     }
 
     // Invoke complete handler only if we have successful keys to report

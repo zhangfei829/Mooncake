@@ -90,6 +90,9 @@ class SpdkEnv {
     void *DmaMalloc(size_t size, size_t align = 4096);
     void DmaFree(void *buf);
 
+    void *DmaPoolAlloc(size_t needed, size_t align = 4096);
+    void DmaPoolFree(void *buf, size_t size);
+
    private:
     SpdkEnv() = default;
     ~SpdkEnv();
@@ -127,6 +130,10 @@ class SpdkEnv {
     std::condition_variable init_cv_;
     bool init_complete_ = false;
     int init_result_ = -1;
+
+    struct DmaPoolEntry { void *buf; size_t size; };
+    std::mutex dma_pool_mutex_;
+    std::vector<DmaPoolEntry> dma_pool_;
 };
 
 }  // namespace mooncake
