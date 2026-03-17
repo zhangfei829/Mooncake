@@ -97,6 +97,7 @@ class SpdkEnv {
                           size_t align = 4096);
     void DmaPoolFreeBatch(void *const *bufs, size_t size, int count);
     void DmaPoolPrewarm(size_t buf_size, int count, size_t align = 4096);
+    void DmaPoolDrain();
 
    private:
     SpdkEnv() = default;

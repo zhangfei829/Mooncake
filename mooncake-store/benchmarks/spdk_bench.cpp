@@ -964,11 +964,11 @@ static void RunBackendBench() {
     int threads = FLAGS_threads;
     int iters = FLAGS_iterations;
 
-    // Pre-warm DMA pool for the backend throughput test
+    // Pre-warm DMA pool with pipeline-depth buffers
     {
+        constexpr int kPipelineQD = 128;
         size_t warm_size = spdk_align_up(value_size + 4096 + 64);
-        int warm_count = static_cast<int>(num_keys);
-        env.DmaPoolPrewarm(warm_size, warm_count, env.GetBlockSize());
+        env.DmaPoolPrewarm(warm_size, kPipelineQD, env.GetBlockSize());
     }
 
     // Header
@@ -1064,13 +1064,10 @@ static void RunBackendBench() {
         8 * 1024 * 1024, 2 * 1024 * 1024, 512 * 1024,
         128 * 1024,      32 * 1024,      4096};
 
-    // Pre-warm DMA pool: allocate enough large buffers so that subsequent
-    // vector_write_batch / vector_read_batch never call spdk_dma_malloc.
-    {
-        size_t warm_size = spdk_align_up(value_sizes.front() + 4096 + 64);
-        int warm_count = static_cast<int>(num_keys);
-        env.DmaPoolPrewarm(warm_size, warm_count, env.GetBlockSize());
-    }
+    // No pre-warm for the sweep: each value size naturally fills the pool via
+    // the write phase, and the read phase reuses those buffers. Large sizes
+    // have few keys (small pipeline QD), so DMA memory stays bounded.
+    // Pre-warming with large buffers would exhaust hugepages.
 
     for (size_t vsz : value_sizes) {
         uint64_t bdev_cap = env.GetBdevSize();
@@ -1126,6 +1123,9 @@ static void RunBackendBench() {
             }
             fs::remove_all(spdk_dir);
         }
+        // Release DMA buffers accumulated during this value-size test
+        // to avoid exhausting hugepages across the sweep.
+        env.DmaPoolDrain();
 
         char row[300];
         std::snprintf(

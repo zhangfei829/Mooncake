@@ -574,4 +574,12 @@ void SpdkEnv::DmaPoolPrewarm(size_t buf_size, int count, size_t align) {
               << buf_size << " bytes";
 }
 
+void SpdkEnv::DmaPoolDrain() {
+    std::lock_guard<std::mutex> lk(dma_pool_mutex_);
+    for (auto &e : dma_pool_) spdk_dma_free(e.buf);
+    size_t n = dma_pool_.size();
+    dma_pool_.clear();
+    LOG(INFO) << "SpdkEnv: DMA pool drained " << n << " buffers";
+}
+
 }  // namespace mooncake
