@@ -287,6 +287,11 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
     auto &env = SpdkEnv::Instance();
     size_t aligned_chunk = spdk_align_up(chunk_size);
 
+    constexpr size_t kMaxDmaTotal = 256ULL * 1024 * 1024;
+    int max_qd = static_cast<int>(kMaxDmaTotal / aligned_chunk);
+    if (max_qd < 2) max_qd = 2;
+    if (iodepth > max_qd) iodepth = max_qd;
+
     auto dma_bufs = std::make_unique<void *[]>(iodepth);
     auto reqs = std::make_unique<SpdkIoRequest[]>(iodepth);
     for (int i = 0; i < iodepth; ++i) {
@@ -394,6 +399,11 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
                                           int iodepth) {
     auto &env = SpdkEnv::Instance();
     size_t aligned_io = spdk_align_up(io_size);
+
+    constexpr size_t kMaxDmaTotal = 256ULL * 1024 * 1024;
+    int max_qd = static_cast<int>(kMaxDmaTotal / aligned_io);
+    if (max_qd < 2) max_qd = 2;
+    if (iodepth > max_qd) iodepth = max_qd;
 
     auto dma_bufs = std::make_unique<void *[]>(iodepth);
     auto reqs = std::make_unique<SpdkIoRequest[]>(iodepth);
