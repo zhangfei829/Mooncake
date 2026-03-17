@@ -466,6 +466,7 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
         offsets[i] = static_cast<off_t>(dist(gen) * block_align);
 
     auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(iodepth);
+    auto submit_ts = std::make_unique<Clock::time_point[]>(iodepth);
 
     BandwidthResult result;
     int submitted = 0, completed_count = 0;
@@ -495,6 +496,7 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
             reqs[slot].src_iov = nullptr;
             reqs[slot].src_iovcnt = 0;
 
+            submit_ts[slot] = Clock::now();
             batch_ptrs[batch_count++] = &reqs[slot];
 
             submitted++;
@@ -506,6 +508,10 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
 
         while (completed_count < submitted) {
             if (!reqs[tail].completed.load(std::memory_order_acquire)) break;
+            auto t_done = Clock::now();
+            double us = std::chrono::duration<double, std::micro>(
+                            t_done - submit_ts[tail]).count();
+            result.latency.Add(us);
             result.total_bytes += io_size;
             result.total_ops++;
             completed_count++;
@@ -872,15 +878,14 @@ static void RunFileRandBench() {
 
     char rhdr[512];
     std::snprintf(rhdr, sizeof(rhdr),
-                  "%10s  │ %24s  │ %24s  │  SPDK %dC QD=%-3d W/R (MB/s) │ %20s",
-                  "NumOps", "Posix IOPS (W / R)",
-                  "Posix W / R (MB/s)", nc, FLAGS_iodepth,
-                  "Speedup W / R");
+                  "%10s  │ %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │ %20s",
+                  "NumOps", "Posix W / R (MB/s)",
+                  nc, FLAGS_iodepth, "Speedup W / R");
     std::cout << rhdr << "\n";
     PrintSeparator();
 
     for (int num_ops : ops_list) {
-        std::vector<double> pw_iops, pr_iops, sw_iops, sr_iops;
+        std::vector<double> pw_mb_v, pr_mb_v, sw_mb_v, sr_mb_v;
 
         for (int iter = 0; iter < FLAGS_iterations; ++iter) {
             // Pre-fill Posix
@@ -905,8 +910,8 @@ static void RunFileRandBench() {
                 PosixFile pf(FLAGS_posix_path, fd);
                 auto wr = BenchFileRand(pf, 4096, file_size, num_ops, true);
                 auto rd = BenchFileRand(pf, 4096, file_size, num_ops, false);
-                pw_iops.push_back(wr.IOPS());
-                pr_iops.push_back(rd.IOPS());
+                pw_mb_v.push_back(wr.BW_MBps());
+                pr_mb_v.push_back(rd.BW_MBps());
             }
             unlink(FLAGS_posix_path.c_str());
 
@@ -916,8 +921,8 @@ static void RunFileRandBench() {
                                              FLAGS_iodepth);
                 auto rd = BenchSpdkRandAsync(4096, file_size, num_ops, false,
                                              FLAGS_iodepth);
-                sw_iops.push_back(wr.IOPS());
-                sr_iops.push_back(rd.IOPS());
+                sw_mb_v.push_back(wr.BW_MBps());
+                sr_mb_v.push_back(rd.BW_MBps());
             }
         }
 
@@ -930,55 +935,74 @@ static void RunFileRandBench() {
             return sum / (v.size() - 2);
         };
 
-        double pw = trimmed_mean(pw_iops), pr = trimmed_mean(pr_iops);
-        double sw = trimmed_mean(sw_iops), sr = trimmed_mean(sr_iops);
-
-        constexpr double kIoSize = 4096.0;
-        constexpr double kMB = 1024.0 * 1024.0;
-        double pw_mb = pw * kIoSize / kMB, pr_mb = pr * kIoSize / kMB;
-        double sw_mb = sw * kIoSize / kMB, sr_mb = sr * kIoSize / kMB;
+        double pw_mb = trimmed_mean(pw_mb_v), pr_mb = trimmed_mean(pr_mb_v);
+        double sw_mb = trimmed_mean(sw_mb_v), sr_mb = trimmed_mean(sr_mb_v);
 
         char row[512];
         std::snprintf(row, sizeof(row),
-                      "%10d  │  %10.0f / %-10.0f  │  %10.1f / %-10.1f  │  "
-                      "%10.1f / %-10.1f  │  %6.2fx / %.2fx",
-                      num_ops, pw, pr, pw_mb, pr_mb, sw_mb, sr_mb,
+                      "%10d  │  %10.1f / %-10.1f   │  "
+                      "%10.1f / %-10.1f   │  %6.2fx / %.2fx",
+                      num_ops, pw_mb, pr_mb, sw_mb, sr_mb,
                       pw_mb > 0 ? sw_mb / pw_mb : 0,
                       pr_mb > 0 ? sr_mb / pr_mb : 0);
         std::cout << row << "\n";
     }
 
-    // Latency detail: re-run Posix sync for per-op latency.
-    // (SPDK async doesn't track per-op latency in this pipeline mode.)
-    std::cout << "\n  Posix per-op latency (us) at 4KB random I/O, "
-              << ops_list.back() << " ops:\n";
-    std::cout << "              "
-              << "       Posix  p50 /    p99 /  p99.9\n";
+    // Latency comparison: 4KB random I/O at QD=1 (industry-standard latency test)
+    constexpr int kLatencyOps = 50000;
+    std::cout << "\n";
+    PrintSeparator();
+    std::cout << "  4KB RANDOM I/O LATENCY (us)  —  QD=1, " << kLatencyOps
+              << " ops\n";
+    PrintSeparator();
+    char lat_hdr[256];
+    std::snprintf(lat_hdr, sizeof(lat_hdr),
+                  "%10s  │  %10s  %10s  %10s  │  %10s  %10s  %10s",
+                  "", "Posix p50", "p99", "p99.9",
+                  "SPDK p50", "p99", "p99.9");
+    std::cout << lat_hdr << "\n";
+    PrintSeparator();
 
+    // Pre-fill both
     {
-        int fd = open(FLAGS_posix_path.c_str(),
-                      OpenPosixFlags(true), 0644);
-        ftruncate(fd, file_size);
+        int fd = open(FLAGS_posix_path.c_str(), OpenPosixFlags(true), 0644);
+        if (fd >= 0) {
+            ftruncate(fd, file_size);
+            PosixFile pf(FLAGS_posix_path, fd);
+            BenchFileSeq(pf, 1024 * 1024, file_size, true, false);
+        }
+    }
+    BenchSpdkSeqAsync(1024 * 1024, file_size, true, false, FLAGS_iodepth);
+
+    // Posix latency (sync, QD=1 by nature)
+    BandwidthResult posix_wlat, posix_rlat;
+    {
+        int fd = open(FLAGS_posix_path.c_str(), OpenPosixFlags(false), 0644);
         PosixFile pf(FLAGS_posix_path, fd);
-        BenchFileSeq(pf, 1024 * 1024, file_size, true, false);
+        posix_wlat = BenchFileRand(pf, 4096, file_size, kLatencyOps, true);
+        posix_rlat = BenchFileRand(pf, 4096, file_size, kLatencyOps, false);
+    }
+    unlink(FLAGS_posix_path.c_str());
 
-        auto pw = BenchFileRand(pf, 4096, file_size, ops_list.back(), true);
-        auto pr = BenchFileRand(pf, 4096, file_size, ops_list.back(), false);
-        close(fd);
-        unlink(FLAGS_posix_path.c_str());
+    // SPDK latency at QD=1
+    auto spdk_wlat = BenchSpdkRandAsync(4096, file_size, kLatencyOps, true, 1);
+    auto spdk_rlat = BenchSpdkRandAsync(4096, file_size, kLatencyOps, false, 1);
 
+    auto print_lat_row = [](const char *label, const LatencyStats &posix,
+                            const LatencyStats &spdk) {
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-                      "  %-10s  %8.1f / %8.1f / %8.1f", "Write",
-                      pw.latency.Percentile(50), pw.latency.Percentile(99),
-                      pw.latency.Percentile(99.9));
+                      "%10s  │  %10.2f  %10.2f  %10.2f  │  %10.2f  %10.2f  %10.2f",
+                      label,
+                      posix.Percentile(50), posix.Percentile(99),
+                      posix.Percentile(99.9),
+                      spdk.Percentile(50), spdk.Percentile(99),
+                      spdk.Percentile(99.9));
         std::cout << buf << "\n";
-        std::snprintf(buf, sizeof(buf),
-                      "  %-10s  %8.1f / %8.1f / %8.1f", "Read",
-                      pr.latency.Percentile(50), pr.latency.Percentile(99),
-                      pr.latency.Percentile(99.9));
-        std::cout << buf << "\n";
-    }
+    };
+
+    print_lat_row("Write", posix_wlat.latency, spdk_wlat.latency);
+    print_lat_row("Read", posix_rlat.latency, spdk_rlat.latency);
     PrintSeparator();
 }
 
@@ -1110,9 +1134,9 @@ static void RunBackendBench() {
     PrintSeparator(120);
 
     std::vector<size_t> value_sizes = {
-        64 * 1024 * 1024, 32 * 1024 * 1024, 16 * 1024 * 1024,
-        8 * 1024 * 1024, 2 * 1024 * 1024, 512 * 1024,
-        128 * 1024,      32 * 1024,      4096};
+        4096,            32 * 1024,       128 * 1024,
+        512 * 1024,      2 * 1024 * 1024, 8 * 1024 * 1024,
+        16 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024};
 
     for (size_t vsz : value_sizes) {
         uint64_t bdev_cap = env.GetBdevSize();
