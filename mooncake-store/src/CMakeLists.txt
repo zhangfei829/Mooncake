@@ -121,7 +121,7 @@ if(USE_SPDK)
   file(GLOB SPDK_SELECTED_LIBS "${SPDK_DIR}/build/lib/libspdk_*.a")
   file(GLOB DPDK_ALL_LIBS "${SPDK_DIR}/dpdk/build/lib/librte_*.a")
   list(FILTER SPDK_SELECTED_LIBS EXCLUDE REGEX
-       "libspdk_ut\\.a$|libspdk_ut_mock|libspdk_iscsi|libspdk_scsi|libspdk_vhost|libspdk_nvmf|libspdk_nbd")
+       "libspdk_ut\\.a$|libspdk_ut_mock|libspdk_iscsi|libspdk_scsi|libspdk_vhost|libspdk_nvmf|libspdk_nbd|libspdk_event_iscsi|libspdk_event_scsi|libspdk_event_vhost|libspdk_event_nvmf|libspdk_event_nbd")
 
   if(TRUE)
     message(STATUS "SPDK: Using whole-archive DPDK + start-group SPDK linking")
