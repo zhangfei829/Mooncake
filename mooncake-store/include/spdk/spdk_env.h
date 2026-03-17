@@ -56,7 +56,22 @@ class SpdkEnv {
         return initialized_.load(std::memory_order_acquire);
     }
 
+    /// Blocking I/O — submits and polls until completion.
     void SubmitIo(SpdkIoRequest *req);
+
+    /// Non-blocking I/O submit.  Caller must call PollIo() afterwards
+    /// to drive completions.  Returns 0 on success, negative errno on
+    /// failure (e.g. -ENOMEM when the bdev queue is full — poll and
+    /// retry in that case).
+    int SubmitIoAsync(SpdkIoRequest *req);
+
+    /// Poll for I/O completions on the calling thread's SPDK context.
+    /// Returns the number of completions processed (0 if nothing ready).
+    int PollIo();
+
+    /// Clean up per-thread SPDK context (call before Shutdown from each
+    /// thread that issued I/O, or let thread_local destructor handle it).
+    void CleanupThreadLocalCtx();
 
     uint32_t GetBlockSize() const { return block_size_; }
     uint64_t GetBdevSize() const { return bdev_size_; }

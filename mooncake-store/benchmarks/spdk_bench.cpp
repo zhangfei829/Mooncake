@@ -58,6 +58,8 @@ DEFINE_uint64(backend_value_kb, 128,
               "Value size in KB for backend test (default: 128)");
 DEFINE_int32(threads, 1,
              "Thread count for concurrent backend test (default: 1)");
+DEFINE_int32(iodepth, 32,
+             "I/O queue depth for SPDK async benchmarks (default: 32)");
 
 // ============================================================================
 // Helpers
@@ -254,6 +256,186 @@ static BandwidthResult BenchFileRand(StorageFile &file, size_t io_size,
 }
 
 // ============================================================================
+// Part 2b: SPDK async sequential bandwidth (iodepth > 1)
+//          Bypasses SpdkFile — uses SpdkEnv async API + DMA buffers directly.
+// ============================================================================
+
+static size_t spdk_align_up(size_t v) {
+    return (v + 4095) & ~4095UL;
+}
+
+static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
+                                         size_t total_bytes, bool is_write,
+                                         bool do_verify, int iodepth) {
+    auto &env = SpdkEnv::Instance();
+    size_t aligned_chunk = spdk_align_up(chunk_size);
+
+    auto dma_bufs = std::make_unique<void *[]>(iodepth);
+    auto reqs = std::make_unique<SpdkIoRequest[]>(iodepth);
+    for (int i = 0; i < iodepth; ++i) {
+        dma_bufs[i] = env.DmaMalloc(aligned_chunk, env.GetBlockSize());
+        if (!dma_bufs[i]) {
+            LOG(ERROR) << "DmaMalloc failed for slot " << i;
+            for (int j = 0; j < i; ++j) env.DmaFree(dma_bufs[j]);
+            return {};
+        }
+    }
+
+    BandwidthResult result;
+    size_t total_ops = total_bytes / chunk_size;
+    size_t submitted = 0, completed = 0;
+    int head = 0, tail = 0;
+    off_t submit_offset = 0;
+
+    std::vector<char> verify_buf;
+    if (do_verify) verify_buf.resize(chunk_size);
+
+    auto wall_t0 = Clock::now();
+
+    while (completed < total_ops) {
+        // --- fill pipeline ---
+        while (submitted - completed < static_cast<size_t>(iodepth) &&
+               submitted < total_ops) {
+            int slot = head;
+
+            if (is_write) {
+                FillPattern(static_cast<char *>(dma_bufs[slot]), chunk_size,
+                            static_cast<uint32_t>(submit_offset));
+                if (aligned_chunk > chunk_size)
+                    std::memset(static_cast<char *>(dma_bufs[slot]) +
+                                    chunk_size,
+                                0, aligned_chunk - chunk_size);
+            }
+
+            reqs[slot].op =
+                is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
+            reqs[slot].buf = dma_bufs[slot];
+            reqs[slot].offset = submit_offset;
+            reqs[slot].nbytes = aligned_chunk;
+
+            int rc = env.SubmitIoAsync(&reqs[slot]);
+            if (rc != 0) {
+                reqs[slot].success = false;
+                reqs[slot].completed.store(true, std::memory_order_release);
+            }
+
+            submit_offset += chunk_size;
+            submitted++;
+            head = (head + 1) % iodepth;
+        }
+
+        // --- poll completions ---
+        env.PollIo();
+
+        // --- drain completed (FIFO) ---
+        while (completed < submitted) {
+            if (!reqs[tail].completed.load(std::memory_order_acquire)) break;
+
+            if (!is_write && do_verify && reqs[tail].success) {
+                off_t chk = static_cast<off_t>(completed * chunk_size);
+                FillPattern(verify_buf.data(), chunk_size,
+                            static_cast<uint32_t>(chk));
+                if (std::memcmp(dma_bufs[tail], verify_buf.data(),
+                                chunk_size) != 0) {
+                    LOG(ERROR) << "Async verify FAILED at offset " << chk;
+                }
+            }
+
+            result.total_bytes += chunk_size;
+            completed++;
+            tail = (tail + 1) % iodepth;
+        }
+    }
+
+    auto wall_t1 = Clock::now();
+    result.total_secs =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
+
+    for (int i = 0; i < iodepth; ++i)
+        if (dma_bufs[i]) env.DmaFree(dma_bufs[i]);
+    return result;
+}
+
+// ============================================================================
+// Part 2c: SPDK async random I/O (iodepth > 1)
+// ============================================================================
+
+static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
+                                          int num_ops, bool is_write,
+                                          int iodepth) {
+    auto &env = SpdkEnv::Instance();
+    size_t aligned_io = spdk_align_up(io_size);
+
+    auto dma_bufs = std::make_unique<void *[]>(iodepth);
+    auto reqs = std::make_unique<SpdkIoRequest[]>(iodepth);
+    for (int i = 0; i < iodepth; ++i) {
+        dma_bufs[i] = env.DmaMalloc(aligned_io, env.GetBlockSize());
+        if (!dma_bufs[i]) {
+            for (int j = 0; j < i; ++j) env.DmaFree(dma_bufs[j]);
+            return {};
+        }
+    }
+
+    size_t block_align = 4096;
+    size_t max_off = (file_size - io_size) / block_align * block_align;
+    std::mt19937 gen(12345);
+    std::uniform_int_distribution<size_t> dist(0, max_off / block_align);
+
+    std::vector<off_t> offsets(num_ops);
+    for (int i = 0; i < num_ops; ++i)
+        offsets[i] = static_cast<off_t>(dist(gen) * block_align);
+
+    BandwidthResult result;
+    int submitted = 0, completed_count = 0;
+    int head = 0, tail = 0;
+
+    auto wall_t0 = Clock::now();
+
+    while (completed_count < num_ops) {
+        while (submitted - completed_count < iodepth && submitted < num_ops) {
+            int slot = head;
+            off_t off = offsets[submitted];
+
+            if (is_write)
+                FillPattern(static_cast<char *>(dma_bufs[slot]), io_size,
+                            static_cast<uint32_t>(off ^ submitted));
+
+            reqs[slot].op =
+                is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
+            reqs[slot].buf = dma_bufs[slot];
+            reqs[slot].offset = off;
+            reqs[slot].nbytes = aligned_io;
+
+            int rc = env.SubmitIoAsync(&reqs[slot]);
+            if (rc != 0) {
+                reqs[slot].success = false;
+                reqs[slot].completed.store(true, std::memory_order_release);
+            }
+
+            submitted++;
+            head = (head + 1) % iodepth;
+        }
+
+        env.PollIo();
+
+        while (completed_count < submitted) {
+            if (!reqs[tail].completed.load(std::memory_order_acquire)) break;
+            result.total_bytes += io_size;
+            completed_count++;
+            tail = (tail + 1) % iodepth;
+        }
+    }
+
+    auto wall_t1 = Clock::now();
+    result.total_secs =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
+
+    for (int i = 0; i < iodepth; ++i)
+        if (dma_bufs[i]) env.DmaFree(dma_bufs[i]);
+    return result;
+}
+
+// ============================================================================
 // Part 3: Backend-level (OffsetAllocatorStorageBackend) throughput
 // ============================================================================
 
@@ -421,8 +603,8 @@ static void PrintLatencyRow(const std::string &label,
 static void RunFileSeqBench() {
     std::cout << "\n";
     PrintSeparator();
-    std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (iterations="
-              << FLAGS_iterations << ")\n";
+    std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (iodepth="
+              << FLAGS_iodepth << ", iterations=" << FLAGS_iterations << ")\n";
     PrintSeparator();
 
     std::vector<size_t> chunk_sizes = {
@@ -435,11 +617,12 @@ static void RunFileSeqBench() {
     auto &env = SpdkEnv::Instance();
     uint64_t bdev_size = env.GetBdevSize();
 
-    std::cout << std::setw(12) << "ChunkSize"
-              << "  │ " << std::setw(26) << "Posix Write / Read (MB/s)"
-              << "  │ " << std::setw(26) << "SPDK  Write / Read (MB/s)"
-              << "  │ " << std::setw(20) << "Speedup W / R"
-              << "\n";
+    char hdr[256];
+    std::snprintf(hdr, sizeof(hdr),
+                  "%12s  │ %26s  │  SPDK QD=%-3d W / R (MB/s)  │ %20s",
+                  "ChunkSize", "Posix Write / Read (MB/s)", FLAGS_iodepth,
+                  "Speedup W / R");
+    std::cout << hdr << "\n";
     PrintSeparator();
 
     for (size_t chunk : chunk_sizes) {
@@ -457,7 +640,7 @@ static void RunFileSeqBench() {
         for (int iter = 0; iter < FLAGS_iterations; ++iter) {
             bool verify_this = FLAGS_verify && (iter == 0);
 
-            // --- Posix ---
+            // --- Posix (sync preadv/pwritev) ---
             {
                 int flags = O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC;
                 int fd = open(FLAGS_posix_path.c_str(), flags, 0644);
@@ -479,11 +662,12 @@ static void RunFileSeqBench() {
             }
             unlink(FLAGS_posix_path.c_str());
 
-            // --- SPDK ---
+            // --- SPDK (async pipeline, QD = iodepth) ---
             {
-                SpdkFile sf("spdk_seq_bench", 0, bdev_size);
-                auto wr = BenchFileSeq(sf, chunk, effective_total, true, false);
-                auto rd = BenchFileSeq(sf, chunk, effective_total, false, verify_this);
+                auto wr = BenchSpdkSeqAsync(chunk, effective_total, true,
+                                            false, FLAGS_iodepth);
+                auto rd = BenchSpdkSeqAsync(chunk, effective_total, false,
+                                            verify_this, FLAGS_iodepth);
                 spdk_w.push_back(wr.BW_MBps());
                 spdk_r.push_back(rd.BW_MBps());
             }
@@ -520,8 +704,8 @@ static void RunFileSeqBench() {
 static void RunFileRandBench() {
     std::cout << "\n";
     PrintSeparator();
-    std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, iterations="
-              << FLAGS_iterations << ")\n";
+    std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, iodepth="
+              << FLAGS_iodepth << ", iterations=" << FLAGS_iterations << ")\n";
     PrintSeparator();
 
     auto &env = SpdkEnv::Instance();
@@ -530,18 +714,19 @@ static void RunFileRandBench() {
 
     std::vector<int> ops_list = {500, 2000, 10000};
 
-    std::cout << std::setw(10) << "NumOps"
-              << "  │ " << std::setw(24) << "Posix IOPS (W / R)"
-              << "  │ " << std::setw(24) << "SPDK  IOPS (W / R)"
-              << "  │ " << std::setw(20) << "Speedup W / R"
-              << "\n";
+    char rhdr[256];
+    std::snprintf(rhdr, sizeof(rhdr),
+                  "%10s  │ %24s  │  SPDK QD=%-3d IOPS W/R    │ %20s",
+                  "NumOps", "Posix IOPS (W / R)", FLAGS_iodepth,
+                  "Speedup W / R");
+    std::cout << rhdr << "\n";
     PrintSeparator();
 
     for (int num_ops : ops_list) {
         std::vector<double> pw_iops, pr_iops, sw_iops, sr_iops;
 
         for (int iter = 0; iter < FLAGS_iterations; ++iter) {
-            // Pre-fill both backends
+            // Pre-fill Posix
             {
                 int fd = open(FLAGS_posix_path.c_str(),
                               O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -552,12 +737,11 @@ static void RunFileRandBench() {
                 }
             }
 
-            {
-                SpdkFile sf("spdk_rand_prefill", 0, bdev_size);
-                BenchFileSeq(sf, 1024 * 1024, file_size, true, false);
-            }
+            // Pre-fill SPDK via async sequential write
+            BenchSpdkSeqAsync(1024 * 1024, file_size, true, false,
+                              FLAGS_iodepth);
 
-            // Posix random
+            // Posix random (sync)
             {
                 int fd = open(FLAGS_posix_path.c_str(),
                               O_RDWR | O_CLOEXEC, 0644);
@@ -569,11 +753,12 @@ static void RunFileRandBench() {
             }
             unlink(FLAGS_posix_path.c_str());
 
-            // SPDK random
+            // SPDK random (async pipeline)
             {
-                SpdkFile sf("spdk_rand_bench", 0, bdev_size);
-                auto wr = BenchFileRand(sf, 4096, file_size, num_ops, true);
-                auto rd = BenchFileRand(sf, 4096, file_size, num_ops, false);
+                auto wr = BenchSpdkRandAsync(4096, file_size, num_ops, true,
+                                             FLAGS_iodepth);
+                auto rd = BenchSpdkRandAsync(4096, file_size, num_ops, false,
+                                             FLAGS_iodepth);
                 sw_iops.push_back(wr.IOPS());
                 sr_iops.push_back(rd.IOPS());
             }
@@ -600,14 +785,13 @@ static void RunFileRandBench() {
         std::cout << row << "\n";
     }
 
-    // Latency detail from last run
-    std::cout << "\n  Latency (us) at 4KB random I/O, " << ops_list.back()
-              << " ops:\n";
+    // Latency detail: re-run Posix sync for per-op latency.
+    // (SPDK async doesn't track per-op latency in this pipeline mode.)
+    std::cout << "\n  Posix per-op latency (us) at 4KB random I/O, "
+              << ops_list.back() << " ops:\n";
     std::cout << "              "
-              << "       Posix  p50 /    p99 /  p99.9       "
-              << "      SPDK   p50 /    p99 /  p99.9\n";
+              << "       Posix  p50 /    p99 /  p99.9\n";
 
-    // Re-run once for detailed latency
     {
         int fd = open(FLAGS_posix_path.c_str(),
                       O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -620,13 +804,17 @@ static void RunFileRandBench() {
         close(fd);
         unlink(FLAGS_posix_path.c_str());
 
-        SpdkFile sf("spdk_lat", 0, bdev_size);
-        BenchFileSeq(sf, 1024 * 1024, file_size, true, false);
-        auto sw = BenchFileRand(sf, 4096, file_size, ops_list.back(), true);
-        auto sr = BenchFileRand(sf, 4096, file_size, ops_list.back(), false);
-
-        PrintLatencyRow("Write", pw.latency, sw.latency);
-        PrintLatencyRow("Read", pr.latency, sr.latency);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "  %-10s  %8.1f / %8.1f / %8.1f", "Write",
+                      pw.latency.Percentile(50), pw.latency.Percentile(99),
+                      pw.latency.Percentile(99.9));
+        std::cout << buf << "\n";
+        std::snprintf(buf, sizeof(buf),
+                      "  %-10s  %8.1f / %8.1f / %8.1f", "Read",
+                      pr.latency.Percentile(50), pr.latency.Percentile(99),
+                      pr.latency.Percentile(99.9));
+        std::cout << buf << "\n";
     }
     PrintSeparator();
 }

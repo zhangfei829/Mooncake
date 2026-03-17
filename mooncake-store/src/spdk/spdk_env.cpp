@@ -252,6 +252,12 @@ void SpdkEnv::CleanupOnSpdkThread(void *ctx) {
 
 void SpdkEnv::Shutdown() {
     if (!initialized_.load(std::memory_order_acquire)) return;
+
+    // Clean up the calling thread's per-thread SPDK context (I/O channel +
+    // SPDK thread) BEFORE tearing down the bdev, so the channel is released
+    // while the bdev descriptor is still valid.
+    CleanupThreadLocalCtx();
+
     initialized_.store(false, std::memory_order_release);
 
     spdk_thread_send_msg(SPDK_THREAD(spdk_thread_), CleanupOnSpdkThread, this);
@@ -261,24 +267,124 @@ void SpdkEnv::Shutdown() {
 }
 
 // ---------------------------------------------------------------------------
-// I/O submission
+// Per-thread SPDK context for direct (zero-cross-thread) I/O submission.
+// Each calling thread lazily creates its own spdk_thread + io_channel,
+// submits bdev I/O directly, and polls for completion locally.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct SpdkThreadCtx {
+    struct spdk_thread *thread = nullptr;
+    struct spdk_io_channel *channel = nullptr;
+
+    void Cleanup() {
+        if (channel) {
+            spdk_put_io_channel(channel);
+            channel = nullptr;
+        }
+        if (thread) {
+            spdk_set_thread(thread);
+            spdk_thread_exit(thread);
+            while (!spdk_thread_is_exited(thread)) {
+                spdk_thread_poll(thread, 0, 0);
+            }
+            spdk_thread_destroy(thread);
+            thread = nullptr;
+        }
+    }
+
+    ~SpdkThreadCtx() { Cleanup(); }
+};
+
+thread_local SpdkThreadCtx g_tls_ctx;
+std::atomic<int> g_worker_id{0};
+
+spdk_bdev_io_completion_cb g_io_done = [](struct spdk_bdev_io *bio,
+                                          bool ok, void *arg) {
+    auto *r = static_cast<mooncake::SpdkIoRequest *>(arg);
+    spdk_bdev_free_io(bio);
+    r->success = ok;
+    r->completed.store(true, std::memory_order_release);
+};
+
+/// Ensure the calling thread has a per-thread SPDK thread + I/O channel.
+static bool EnsureThreadCtx(SpdkThreadCtx &ctx, void *bdev_desc) {
+    if (ctx.thread) return true;
+    char name[64];
+    std::snprintf(name, sizeof(name), "mc_worker_%d",
+                  g_worker_id.fetch_add(1, std::memory_order_relaxed));
+    ctx.thread = spdk_thread_create(name, nullptr);
+    if (!ctx.thread) return false;
+
+    spdk_set_thread(ctx.thread);
+    ctx.channel = spdk_bdev_get_io_channel(
+        static_cast<struct spdk_bdev_desc *>(bdev_desc));
+    if (!ctx.channel) {
+        LOG(WARNING) << "SpdkEnv: per-thread io_channel failed";
+        spdk_set_thread(ctx.thread);
+        spdk_thread_exit(ctx.thread);
+        while (!spdk_thread_is_exited(ctx.thread))
+            spdk_thread_poll(ctx.thread, 0, 0);
+        spdk_thread_destroy(ctx.thread);
+        ctx.thread = nullptr;
+        return false;
+    }
+    return true;
+}
+
+}  // anonymous namespace
+
+void SpdkEnv::CleanupThreadLocalCtx() { g_tls_ctx.Cleanup(); }
+
+// ---------------------------------------------------------------------------
+// Non-blocking async I/O submit.
+// Returns 0 on success, negative errno on failure.
+// ---------------------------------------------------------------------------
+int SpdkEnv::SubmitIoAsync(SpdkIoRequest *req) {
+    if (!initialized_.load(std::memory_order_acquire)) return -EINVAL;
+
+    auto &ctx = g_tls_ctx;
+    if (!EnsureThreadCtx(ctx, bdev_desc_)) return -ENODEV;
+
+    spdk_set_thread(ctx.thread);
+    req->completed.store(false, std::memory_order_relaxed);
+    req->success = false;
+
+    int rc;
+    if (req->op == SpdkIoRequest::WRITE) {
+        rc = spdk_bdev_write(SPDK_DESC(bdev_desc_), ctx.channel,
+                             req->buf, req->offset, req->nbytes,
+                             g_io_done, req);
+    } else {
+        rc = spdk_bdev_read(SPDK_DESC(bdev_desc_), ctx.channel,
+                            req->buf, req->offset, req->nbytes,
+                            g_io_done, req);
+    }
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Poll for completions on the calling thread's SPDK context.
+// ---------------------------------------------------------------------------
+int SpdkEnv::PollIo() {
+    auto &ctx = g_tls_ctx;
+    if (!ctx.thread) return 0;
+    spdk_set_thread(ctx.thread);
+    return spdk_thread_poll(ctx.thread, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Blocking I/O — submit + poll until done.
 // ---------------------------------------------------------------------------
 void SpdkEnv::SubmitIo(SpdkIoRequest *req) {
-    if (!initialized_.load(std::memory_order_acquire) || !spdk_thread_) {
+    int rc = SubmitIoAsync(req);
+    if (rc != 0) {
         req->success = false;
         req->completed.store(true, std::memory_order_release);
         return;
     }
-    req->completed.store(false, std::memory_order_release);
-    req->success = false;
-    spdk_thread_send_msg(SPDK_THREAD(spdk_thread_), execute_io_cb, req);
-
     while (!req->completed.load(std::memory_order_acquire)) {
-#if defined(__x86_64__) || defined(_M_X64)
-        __builtin_ia32_pause();
-#else
-        std::this_thread::yield();
-#endif
+        PollIo();
     }
 }
 
