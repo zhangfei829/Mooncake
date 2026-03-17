@@ -36,12 +36,8 @@ void execute_io_cb(void *ctx) {
                                          void *arg) {
         auto *r = static_cast<mooncake::SpdkIoRequest *>(arg);
         spdk_bdev_free_io(bio);
-        {
-            std::lock_guard<std::mutex> lk(r->mtx);
-            r->success = ok;
-            r->completed = true;
-        }
-        r->cv.notify_one();
+        r->success = ok;
+        r->completed.store(true, std::memory_order_release);
     };
 
     int rc;
@@ -56,10 +52,8 @@ void execute_io_cb(void *ctx) {
     }
     if (rc != 0) {
         LOG(ERROR) << "SpdkEnv: bdev I/O submit failed rc=" << rc;
-        std::lock_guard<std::mutex> lk(req->mtx);
         req->success = false;
-        req->completed = true;
-        req->cv.notify_one();
+        req->completed.store(true, std::memory_order_release);
     }
 }
 
@@ -271,17 +265,21 @@ void SpdkEnv::Shutdown() {
 // ---------------------------------------------------------------------------
 void SpdkEnv::SubmitIo(SpdkIoRequest *req) {
     if (!initialized_.load(std::memory_order_acquire) || !spdk_thread_) {
-        std::lock_guard<std::mutex> lk(req->mtx);
         req->success = false;
-        req->completed = true;
+        req->completed.store(true, std::memory_order_release);
         return;
     }
-    req->completed = false;
+    req->completed.store(false, std::memory_order_release);
     req->success = false;
     spdk_thread_send_msg(SPDK_THREAD(spdk_thread_), execute_io_cb, req);
 
-    std::unique_lock<std::mutex> lk(req->mtx);
-    req->cv.wait(lk, [req] { return req->completed; });
+    while (!req->completed.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
 }
 
 // ---------------------------------------------------------------------------

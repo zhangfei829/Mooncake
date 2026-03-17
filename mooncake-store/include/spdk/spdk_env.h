@@ -35,9 +35,7 @@ struct SpdkIoRequest {
     uint64_t offset;
     uint64_t nbytes;
 
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool completed = false;
+    std::atomic<bool> completed{false};
     bool success = false;
 };
 
