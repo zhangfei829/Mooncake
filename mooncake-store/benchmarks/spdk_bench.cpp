@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
@@ -60,10 +61,23 @@ DEFINE_int32(threads, 1,
              "Thread count for concurrent backend test (default: 1)");
 DEFINE_int32(iodepth, 32,
              "I/O queue depth for SPDK async benchmarks (default: 32)");
+DEFINE_int32(cores, 1,
+             "Number of SPDK reactor cores (default: 1)");
 
 // ============================================================================
 // Helpers
 // ============================================================================
+
+static std::string BuildCoreMask(int num_cores) {
+    if (num_cores <= 0) num_cores = 1;
+    if (num_cores > 64) num_cores = 64;
+    uint64_t mask = (num_cores >= 64)
+                        ? ~uint64_t(0)
+                        : ((uint64_t(1) << num_cores) - 1);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%" PRIx64, mask);
+    return buf;
+}
 
 static std::string FormatSize(uint64_t bytes) {
     const char *units[] = {"B", "KB", "MB", "GB"};
@@ -107,6 +121,7 @@ struct LatencyStats {
 struct BandwidthResult {
     double total_bytes = 0;
     double total_secs = 0;
+    size_t total_ops = 0;
     LatencyStats latency;
 
     double BW_MBps() const {
@@ -115,7 +130,9 @@ struct BandwidthResult {
     }
 
     double IOPS() const {
-        return total_secs > 0 ? latency.Count() / total_secs : 0;
+        if (total_secs <= 0) return 0;
+        size_t ops = total_ops > 0 ? total_ops : latency.Count();
+        return static_cast<double>(ops) / total_secs;
     }
 };
 
@@ -342,6 +359,7 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
             }
 
             result.total_bytes += chunk_size;
+            result.total_ops++;
             completed++;
             tail = (tail + 1) % iodepth;
         }
@@ -421,6 +439,7 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
         while (completed_count < submitted) {
             if (!reqs[tail].completed.load(std::memory_order_acquire)) break;
             result.total_bytes += io_size;
+            result.total_ops++;
             completed_count++;
             tail = (tail + 1) % iodepth;
         }
@@ -603,8 +622,9 @@ static void PrintLatencyRow(const std::string &label,
 static void RunFileSeqBench() {
     std::cout << "\n";
     PrintSeparator();
-    std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (iodepth="
-              << FLAGS_iodepth << ", iterations=" << FLAGS_iterations << ")\n";
+    std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (cores="
+              << FLAGS_cores << ", iodepth=" << FLAGS_iodepth
+              << ", iterations=" << FLAGS_iterations << ")\n";
     PrintSeparator();
 
     std::vector<size_t> chunk_sizes = {
@@ -616,11 +636,12 @@ static void RunFileSeqBench() {
 
     auto &env = SpdkEnv::Instance();
     uint64_t bdev_size = env.GetBdevSize();
+    int nc = env.GetNumReactors();
 
     char hdr[256];
     std::snprintf(hdr, sizeof(hdr),
-                  "%12s  │ %26s  │  SPDK QD=%-3d W / R (MB/s)  │ %20s",
-                  "ChunkSize", "Posix Write / Read (MB/s)", FLAGS_iodepth,
+                  "%12s  │ %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │ %20s",
+                  "ChunkSize", "Posix Write / Read (MB/s)", nc, FLAGS_iodepth,
                   "Speedup W / R");
     std::cout << hdr << "\n";
     PrintSeparator();
@@ -704,20 +725,22 @@ static void RunFileSeqBench() {
 static void RunFileRandBench() {
     std::cout << "\n";
     PrintSeparator();
-    std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, iodepth="
-              << FLAGS_iodepth << ", iterations=" << FLAGS_iterations << ")\n";
+    std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, cores="
+              << FLAGS_cores << ", iodepth=" << FLAGS_iodepth
+              << ", iterations=" << FLAGS_iterations << ")\n";
     PrintSeparator();
 
     auto &env = SpdkEnv::Instance();
     uint64_t bdev_size = env.GetBdevSize();
     size_t file_size = FLAGS_spdk_malloc_mb * 1024ULL * 1024 / 2;
+    int nc = env.GetNumReactors();
 
     std::vector<int> ops_list = {500, 2000, 10000};
 
     char rhdr[256];
     std::snprintf(rhdr, sizeof(rhdr),
-                  "%10s  │ %24s  │  SPDK QD=%-3d IOPS W/R    │ %20s",
-                  "NumOps", "Posix IOPS (W / R)", FLAGS_iodepth,
+                  "%10s  │ %24s  │  SPDK %dC QD=%-3d IOPS W/R │ %20s",
+                  "NumOps", "Posix IOPS (W / R)", nc, FLAGS_iodepth,
                   "Speedup W / R");
     std::cout << rhdr << "\n";
     PrintSeparator();
@@ -1027,17 +1050,20 @@ int main(int argc, char **argv) {
     cfg.malloc_num_blocks =
         (FLAGS_spdk_malloc_mb * 1024ULL * 1024) / 4096;
     cfg.malloc_block_size = 4096;
+    cfg.reactor_mask = BuildCoreMask(FLAGS_cores);
 
     std::cout << "Initializing SPDK (malloc bdev "
-              << FLAGS_spdk_malloc_mb << " MB)...\n";
+              << FLAGS_spdk_malloc_mb << " MB, cores="
+              << FLAGS_cores << ", mask=" << cfg.reactor_mask << ")...\n";
     int rc = SpdkEnv::Instance().Init(cfg);
     if (rc != 0) {
         LOG(FATAL) << "SpdkEnv::Init failed rc=" << rc;
         return 1;
     }
-    std::cout << "SPDK ready: block_size=" << SpdkEnv::Instance().GetBlockSize()
-              << " bdev_size=" << FormatSize(SpdkEnv::Instance().GetBdevSize())
-              << "\n";
+    auto &env = SpdkEnv::Instance();
+    std::cout << "SPDK ready: block_size=" << env.GetBlockSize()
+              << " bdev_size=" << FormatSize(env.GetBdevSize())
+              << " reactors=" << env.GetNumReactors() << "\n";
 
     std::string test = FLAGS_test;
 

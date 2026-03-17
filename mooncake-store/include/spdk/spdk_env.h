@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace mooncake { class SpdkEnv; }
 
@@ -15,6 +16,8 @@ void execute_io_cb(void *ctx);
 void app_start_cb(void *ctx);
 void open_bdev_cb(void *ctx);
 void signal_init_done(mooncake::SpdkEnv *env, int rc);
+void init_reactor_cb(void *arg1, void *arg2);
+void cleanup_reactor_cb(void *arg1, void *arg2);
 
 namespace mooncake {
 
@@ -26,6 +29,8 @@ struct SpdkEnvConfig {
     bool use_malloc_bdev = false;
     uint64_t malloc_num_blocks = 131072;
     uint32_t malloc_block_size = 4096;
+
+    std::string reactor_mask = "0x1";
 };
 
 struct SpdkIoRequest {
@@ -37,14 +42,16 @@ struct SpdkIoRequest {
 
     std::atomic<bool> completed{false};
     bool success = false;
+
+    void *_io_channel = nullptr;
 };
 
-/// Singleton managing the SPDK environment lifecycle.
-///
-/// Initializes SPDK in embedded mode (no spdk_app_start): env + thread lib +
-/// bdev subsystem, all driven by a dedicated reactor thread running
-/// spdk_thread_poll. Any Mooncake thread can submit I/O through SubmitIo()
-/// which bridges the async SPDK world back to a blocking call.
+struct ReactorCtx {
+    void *spdk_thread = nullptr;
+    void *io_channel = nullptr;
+    uint32_t core_id = 0;
+};
+
 class SpdkEnv {
    public:
     static SpdkEnv &Instance();
@@ -56,25 +63,14 @@ class SpdkEnv {
         return initialized_.load(std::memory_order_acquire);
     }
 
-    /// Blocking I/O — submits and polls until completion.
     void SubmitIo(SpdkIoRequest *req);
-
-    /// Non-blocking I/O submit.  Caller must call PollIo() afterwards
-    /// to drive completions.  Returns 0 on success, negative errno on
-    /// failure (e.g. -ENOMEM when the bdev queue is full — poll and
-    /// retry in that case).
     int SubmitIoAsync(SpdkIoRequest *req);
-
-    /// Poll for I/O completions on the calling thread's SPDK context.
-    /// Returns the number of completions processed (0 if nothing ready).
     int PollIo();
-
-    /// Clean up per-thread SPDK context (call before Shutdown from each
-    /// thread that issued I/O, or let thread_local destructor handle it).
     void CleanupThreadLocalCtx();
 
     uint32_t GetBlockSize() const { return block_size_; }
     uint64_t GetBdevSize() const { return bdev_size_; }
+    int GetNumReactors() const { return num_reactors_; }
 
     void *DmaMalloc(size_t size, size_t align = 4096);
     void DmaFree(void *buf);
@@ -85,8 +81,6 @@ class SpdkEnv {
     SpdkEnv(const SpdkEnv &) = delete;
     SpdkEnv &operator=(const SpdkEnv &) = delete;
 
-    void ReactorLoop();
-    int InitOnSpdkThread();
     static void CleanupOnSpdkThread(void *ctx);
 
     friend void ::bdev_init_complete_cb(void *, int);
@@ -94,20 +88,20 @@ class SpdkEnv {
     friend void ::app_start_cb(void *);
     friend void ::open_bdev_cb(void *);
     friend void ::signal_init_done(mooncake::SpdkEnv *, int);
+    friend void ::init_reactor_cb(void *, void *);
+    friend void ::cleanup_reactor_cb(void *, void *);
 
     std::atomic<bool> initialized_{false};
-    std::atomic<bool> should_stop_{false};
-    std::atomic<bool> bdev_init_done_{false};
-    int bdev_init_rc_ = -1;
 
     std::thread reactor_thread_;
 
-    // Opaque SPDK handles — stored as void* to avoid leaking C types
-    // into C++ headers. Cast back in the .cpp file.
-    void *spdk_thread_ = nullptr;
     void *bdev_ = nullptr;
     void *bdev_desc_ = nullptr;
-    void *io_channel_ = nullptr;
+
+    std::vector<ReactorCtx> reactors_;
+    int num_reactors_ = 0;
+    std::atomic<uint64_t> next_reactor_{0};
+    std::atomic<int> reactors_ready_{0};
 
     uint32_t block_size_ = 0;
     uint64_t bdev_size_ = 0;
