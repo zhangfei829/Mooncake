@@ -137,14 +137,10 @@ static BandwidthResult BenchFileSeq(StorageFile &file, size_t chunk_size,
                                     size_t total_bytes, bool is_write,
                                     bool do_verify) {
     BandwidthResult result;
-    auto &env = SpdkEnv::Instance();
     size_t remaining = total_bytes;
     off_t offset = 0;
 
-    std::vector<char> pattern;
-    if (do_verify && is_write) {
-        pattern.resize(chunk_size);
-    }
+    auto wall_t0 = Clock::now();
 
     while (remaining > 0) {
         size_t this_chunk = std::min(chunk_size, remaining);
@@ -194,6 +190,9 @@ static BandwidthResult BenchFileSeq(StorageFile &file, size_t chunk_size,
         remaining -= this_chunk;
     }
 
+    auto wall_t1 = Clock::now();
+    result.total_secs =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
     result.latency.Sort();
     return result;
 }
@@ -211,6 +210,8 @@ static BandwidthResult BenchFileRand(StorageFile &file, size_t io_size,
 
     std::mt19937 gen(12345);
     std::uniform_int_distribution<size_t> dist(0, max_offset / block_align);
+
+    auto wall_t0 = Clock::now();
 
     for (int i = 0; i < num_ops; ++i) {
         off_t offset = static_cast<off_t>(dist(gen) * block_align);
@@ -243,6 +244,9 @@ static BandwidthResult BenchFileRand(StorageFile &file, size_t io_size,
         }
     }
 
+    auto wall_t1 = Clock::now();
+    result.total_secs =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
     result.latency.Sort();
     return result;
 }
