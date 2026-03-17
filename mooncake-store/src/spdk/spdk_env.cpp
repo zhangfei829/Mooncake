@@ -32,10 +32,9 @@ static void bdev_event_cb(enum spdk_bdev_event_type type,
 }
 
 // ---------------------------------------------------------------------------
-// execute_io_cb — runs on the reactor that owns req->_io_channel.
+// submit_single_io — core I/O submission logic, always runs on a reactor.
 // ---------------------------------------------------------------------------
-void execute_io_cb(void *ctx) {
-    auto *req = static_cast<mooncake::SpdkIoRequest *>(ctx);
+static void submit_single_io(mooncake::SpdkIoRequest *req) {
     auto &env = mooncake::SpdkEnv::Instance();
 
     spdk_bdev_io_completion_cb done = [](struct spdk_bdev_io *bio, bool ok,
@@ -79,6 +78,25 @@ void execute_io_cb(void *ctx) {
         LOG(ERROR) << "SpdkEnv: bdev I/O submit failed rc=" << rc;
         req->success = false;
         req->completed.store(true, std::memory_order_release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// execute_io_cb — single request callback (for SubmitIoAsync).
+// ---------------------------------------------------------------------------
+void execute_io_cb(void *ctx) {
+    submit_single_io(static_cast<mooncake::SpdkIoRequest *>(ctx));
+}
+
+// ---------------------------------------------------------------------------
+// execute_io_batch_cb — batch callback: walk linked list, submit each I/O.
+// ---------------------------------------------------------------------------
+void execute_io_batch_cb(void *ctx) {
+    auto *req = static_cast<mooncake::SpdkIoRequest *>(ctx);
+    while (req) {
+        auto *next = req->_next_batch;
+        submit_single_io(req);
+        req = next;
     }
 }
 
@@ -397,6 +415,43 @@ int SpdkEnv::SubmitIoAsync(SpdkIoRequest *req) {
 
     return spdk_thread_send_msg(SPDK_THREAD(r.spdk_thread),
                                 execute_io_cb, req);
+}
+
+int SpdkEnv::SubmitIoBatchAsync(SpdkIoRequest **reqs, int count) {
+    if (!initialized_.load(std::memory_order_acquire) || num_reactors_ == 0)
+        return -EINVAL;
+    if (count <= 0) return 0;
+
+    constexpr int kMaxReactors = 64;
+    SpdkIoRequest *heads[kMaxReactors] = {};
+    SpdkIoRequest *tails[kMaxReactors] = {};
+
+    uint64_t base = next_reactor_.fetch_add(
+        static_cast<uint64_t>(count), std::memory_order_relaxed);
+
+    for (int i = 0; i < count; ++i) {
+        int rid = static_cast<int>((base + static_cast<uint64_t>(i)) %
+                                   static_cast<uint64_t>(num_reactors_));
+        auto *req = reqs[i];
+        req->_io_channel = reactors_[rid].io_channel;
+        req->completed.store(false, std::memory_order_release);
+        req->success = false;
+        req->_next_batch = nullptr;
+
+        if (!heads[rid]) {
+            heads[rid] = tails[rid] = req;
+        } else {
+            tails[rid]->_next_batch = req;
+            tails[rid] = req;
+        }
+    }
+
+    for (int r = 0; r < num_reactors_; ++r) {
+        if (!heads[r]) continue;
+        spdk_thread_send_msg(SPDK_THREAD(reactors_[r].spdk_thread),
+                             execute_io_batch_cb, heads[r]);
+    }
+    return 0;
 }
 
 int SpdkEnv::PollIo() {

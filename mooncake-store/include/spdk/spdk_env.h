@@ -15,6 +15,7 @@ namespace mooncake { class SpdkEnv; }
 
 void bdev_init_complete_cb(void *ctx, int rc);
 void execute_io_cb(void *ctx);
+void execute_io_batch_cb(void *ctx);
 void app_start_cb(void *ctx);
 void open_bdev_cb(void *ctx);
 void signal_init_done(mooncake::SpdkEnv *env, int rc);
@@ -51,6 +52,8 @@ struct SpdkIoRequest {
     uint64_t src_len = 0;
     const struct iovec *src_iov = nullptr;
     int src_iovcnt = 0;
+
+    SpdkIoRequest *_next_batch = nullptr;
 };
 
 struct ReactorCtx {
@@ -72,6 +75,7 @@ class SpdkEnv {
 
     void SubmitIo(SpdkIoRequest *req);
     int SubmitIoAsync(SpdkIoRequest *req);
+    int SubmitIoBatchAsync(SpdkIoRequest **reqs, int count);
     int PollIo();
     void CleanupThreadLocalCtx();
 
@@ -92,6 +96,7 @@ class SpdkEnv {
 
     friend void ::bdev_init_complete_cb(void *, int);
     friend void ::execute_io_cb(void *);
+    friend void ::execute_io_batch_cb(void *);
     friend void ::app_start_cb(void *);
     friend void ::open_bdev_cb(void *);
     friend void ::signal_init_done(mooncake::SpdkEnv *, int);

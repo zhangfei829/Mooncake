@@ -59,8 +59,8 @@ DEFINE_uint64(backend_value_kb, 128,
               "Value size in KB for backend test (default: 128)");
 DEFINE_int32(threads, 1,
              "Thread count for concurrent backend test (default: 1)");
-DEFINE_int32(iodepth, 32,
-             "I/O queue depth for SPDK async benchmarks (default: 32)");
+DEFINE_int32(iodepth, 128,
+             "I/O queue depth for SPDK async benchmarks (default: 128)");
 DEFINE_int32(cores, 8,
              "Number of SPDK reactor cores (default: 1)");
 
@@ -316,10 +316,13 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
     std::vector<char> verify_buf;
     if (do_verify) verify_buf.resize(chunk_size);
 
+    auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(iodepth);
+
     auto wall_t0 = Clock::now();
 
     while (completed < total_ops) {
-        // --- fill pipeline ---
+        // --- fill pipeline (batch) ---
+        int batch_count = 0;
         while (submitted - completed < static_cast<size_t>(iodepth) &&
                submitted < total_ops) {
             int slot = head;
@@ -340,19 +343,15 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
             reqs[slot].src_iov = nullptr;
             reqs[slot].src_iovcnt = 0;
 
-            int rc = env.SubmitIoAsync(&reqs[slot]);
-            if (rc != 0) {
-                reqs[slot].success = false;
-                reqs[slot].completed.store(true, std::memory_order_release);
-            }
+            batch_ptrs[batch_count++] = &reqs[slot];
 
             submit_offset += chunk_size;
             submitted++;
             head = (head + 1) % iodepth;
         }
 
-        // --- poll completions ---
-        env.PollIo();
+        if (batch_count > 0)
+            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
 
         // --- drain completed (FIFO) ---
         while (completed < submitted) {
@@ -424,6 +423,8 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
     for (int i = 0; i < num_ops; ++i)
         offsets[i] = static_cast<off_t>(dist(gen) * block_align);
 
+    auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(iodepth);
+
     BandwidthResult result;
     int submitted = 0, completed_count = 0;
     int head = 0, tail = 0;
@@ -431,6 +432,7 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
     auto wall_t0 = Clock::now();
 
     while (completed_count < num_ops) {
+        int batch_count = 0;
         while (submitted - completed_count < iodepth && submitted < num_ops) {
             int slot = head;
             off_t off = offsets[submitted];
@@ -451,17 +453,14 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
             reqs[slot].src_iov = nullptr;
             reqs[slot].src_iovcnt = 0;
 
-            int rc = env.SubmitIoAsync(&reqs[slot]);
-            if (rc != 0) {
-                reqs[slot].success = false;
-                reqs[slot].completed.store(true, std::memory_order_release);
-            }
+            batch_ptrs[batch_count++] = &reqs[slot];
 
             submitted++;
             head = (head + 1) % iodepth;
         }
 
-        env.PollIo();
+        if (batch_count > 0)
+            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
 
         while (completed_count < submitted) {
             if (!reqs[tail].completed.load(std::memory_order_acquire)) break;
@@ -762,7 +761,7 @@ static void RunFileRandBench() {
     size_t file_size = FLAGS_spdk_malloc_mb * 1024ULL * 1024 / 2;
     int nc = env.GetNumReactors();
 
-    std::vector<int> ops_list = {500, 2000, 10000};
+    std::vector<int> ops_list = {10000, 50000, 200000};
 
     char rhdr[256];
     std::snprintf(rhdr, sizeof(rhdr),
