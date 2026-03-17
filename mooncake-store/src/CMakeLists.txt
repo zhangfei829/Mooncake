@@ -120,7 +120,8 @@ if(USE_SPDK)
   # Only exclude ut/ut_mock (test stubs requiring CUnit + --wrap).
   file(GLOB SPDK_SELECTED_LIBS "${SPDK_DIR}/build/lib/libspdk_*.a")
   file(GLOB DPDK_ALL_LIBS "${SPDK_DIR}/dpdk/build/lib/librte_*.a")
-  list(FILTER SPDK_SELECTED_LIBS EXCLUDE REGEX "libspdk_ut\\.a$|libspdk_ut_mock")
+  list(FILTER SPDK_SELECTED_LIBS EXCLUDE REGEX
+       "libspdk_ut\\.a$|libspdk_ut_mock|libspdk_iscsi|libspdk_scsi|libspdk_vhost|libspdk_nvmf|libspdk_nbd")
 
   if(TRUE)
     message(STATUS "SPDK: Using whole-archive DPDK + start-group SPDK linking")

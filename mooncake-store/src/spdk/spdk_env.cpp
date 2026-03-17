@@ -360,6 +360,9 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
         opts.name = config_.name.c_str();
         opts.shutdown_cb = nullptr;
         opts.reactor_mask = config_.reactor_mask.c_str();
+        if (config_.mem_size_mb > 0) {
+            opts.mem_size = config_.mem_size_mb;
+        }
         if (!json_path.empty()) {
             opts.json_config_file = json_path.c_str();
         }

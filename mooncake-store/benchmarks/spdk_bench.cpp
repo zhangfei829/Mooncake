@@ -74,6 +74,9 @@ DEFINE_bool(posix_direct, false,
 DEFINE_string(posix_backend_dir, "",
               "Directory for Posix backend tests (default: /tmp). "
               "Set to a mount point on real NVMe for fair disk comparison.");
+DEFINE_int32(mem_size_mb, 0,
+             "Limit DPDK hugepage memory in MB (0 = use all available). "
+             "Useful on machines with limited RAM.");
 
 // ============================================================================
 // Helpers
@@ -1233,6 +1236,7 @@ int main(int argc, char **argv) {
     // Init SPDK
     SpdkEnvConfig cfg;
     cfg.reactor_mask = BuildCoreMask(FLAGS_cores);
+    cfg.mem_size_mb = FLAGS_mem_size_mb;
 
     if (!FLAGS_nvme_pci_addr.empty()) {
         cfg.use_malloc_bdev = false;

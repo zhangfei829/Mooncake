@@ -40,6 +40,9 @@ struct SpdkEnvConfig {
     std::string nvme_ctrl_name = "NVMe0";
 
     std::string reactor_mask = "0x1";
+
+    // Limit DPDK hugepage memory (MB). 0 = use all available hugepages.
+    int mem_size_mb = 0;
 };
 
 struct SpdkIoRequest {
