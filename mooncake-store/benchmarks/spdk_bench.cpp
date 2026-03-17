@@ -61,7 +61,7 @@ DEFINE_int32(threads, 1,
              "Thread count for concurrent backend test (default: 1)");
 DEFINE_int32(iodepth, 32,
              "I/O queue depth for SPDK async benchmarks (default: 32)");
-DEFINE_int32(cores, 1,
+DEFINE_int32(cores, 8,
              "Number of SPDK reactor cores (default: 1)");
 
 // ============================================================================
