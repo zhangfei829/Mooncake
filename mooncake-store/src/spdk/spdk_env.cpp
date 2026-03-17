@@ -34,9 +34,7 @@ static void bdev_event_cb(enum spdk_bdev_event_type type,
 // ---------------------------------------------------------------------------
 // submit_single_io — core I/O submission logic, always runs on a reactor.
 // ---------------------------------------------------------------------------
-static void submit_single_io(mooncake::SpdkIoRequest *req) {
-    auto &env = mooncake::SpdkEnv::Instance();
-
+static void submit_single_io(mooncake::SpdkIoRequest *req, void *bdev_desc) {
     spdk_bdev_io_completion_cb done = [](struct spdk_bdev_io *bio, bool ok,
                                          void *arg) {
         auto *r = static_cast<mooncake::SpdkIoRequest *>(arg);
@@ -68,10 +66,10 @@ static void submit_single_io(mooncake::SpdkIoRequest *req) {
     auto *ch = SPDK_CHAN(req->_io_channel);
     int rc;
     if (req->op == mooncake::SpdkIoRequest::WRITE) {
-        rc = spdk_bdev_write(SPDK_DESC(env.bdev_desc_), ch,
+        rc = spdk_bdev_write(SPDK_DESC(bdev_desc), ch,
                              req->buf, req->offset, req->nbytes, done, req);
     } else {
-        rc = spdk_bdev_read(SPDK_DESC(env.bdev_desc_), ch,
+        rc = spdk_bdev_read(SPDK_DESC(bdev_desc), ch,
                             req->buf, req->offset, req->nbytes, done, req);
     }
     if (rc != 0) {
@@ -85,17 +83,20 @@ static void submit_single_io(mooncake::SpdkIoRequest *req) {
 // execute_io_cb — single request callback (for SubmitIoAsync).
 // ---------------------------------------------------------------------------
 void execute_io_cb(void *ctx) {
-    submit_single_io(static_cast<mooncake::SpdkIoRequest *>(ctx));
+    auto &env = mooncake::SpdkEnv::Instance();
+    submit_single_io(static_cast<mooncake::SpdkIoRequest *>(ctx),
+                     env.bdev_desc_);
 }
 
 // ---------------------------------------------------------------------------
 // execute_io_batch_cb — batch callback: walk linked list, submit each I/O.
 // ---------------------------------------------------------------------------
 void execute_io_batch_cb(void *ctx) {
+    auto &env = mooncake::SpdkEnv::Instance();
     auto *req = static_cast<mooncake::SpdkIoRequest *>(ctx);
     while (req) {
         auto *next = req->_next_batch;
-        submit_single_io(req);
+        submit_single_io(req, env.bdev_desc_);
         req = next;
     }
 }
