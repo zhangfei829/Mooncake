@@ -2788,71 +2788,61 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         // Lock released here; allocation stays alive via shared_ptr
     }
 
-    // Step 2: Perform disk I/O without holding any locks
-    // Allocations are kept alive by shared_ptr references in read_plans
-    for (const auto& plan : read_plans) {
-        // Read header first
-        RecordHeader header;
-        iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
-                                {&header.value_len, sizeof(header.value_len)}};
-        auto read_header_result =
-            data_file_->vector_read(header_iovs, 2, plan.offset);
-        if (!read_header_result) {
-            LOG(ERROR) << "Failed to read header for key: " << plan.key
-                       << ", error: " << read_header_result.error();
-            return tl::make_unexpected(read_header_result.error());
+    // Step 2: Perform disk I/O without holding any locks.
+    // Merge header+key+value into a single read per key and batch all reads.
+    // Allocations are kept alive by shared_ptr references in read_plans.
+    {
+        const size_t n = read_plans.size();
+
+        // Per-key temp buffer for header+key; value goes directly to dest.
+        std::vector<std::vector<char>> hk_bufs(n);
+        std::vector<std::array<iovec, 2>> iovs(n);
+        std::vector<StorageFile::BatchReadEntry> entries(n);
+
+        for (size_t i = 0; i < n; ++i) {
+            const auto& plan = read_plans[i];
+            size_t hk_len = RecordHeader::SIZE + plan.key.size();
+            hk_bufs[i].resize(hk_len);
+
+            iovs[i][0] = {hk_bufs[i].data(), hk_len};
+            iovs[i][1] = {plan.dest_slice.ptr, plan.dest_slice.size};
+
+            entries[i] = {iovs[i].data(), 2,
+                          static_cast<off_t>(plan.offset)};
         }
 
-        if (read_header_result.value() != RecordHeader::SIZE) {
-            LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        auto batch_result =
+            data_file_->vector_read_batch(entries.data(),
+                                          static_cast<int>(n));
+        if (!batch_result) {
+            LOG(ERROR) << "Batch read failed: " << batch_result.error();
+            return tl::make_unexpected(batch_result.error());
         }
 
-        // Validate header matches metadata
-        if (!header.ValidateAgainstMetadata(plan.value_size)) {
-            LOG(ERROR) << "Stored value_len mismatch for key: " << plan.key
-                       << ", metadata: " << plan.value_size
-                       << ", header: " << header.value_len;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
+        // Validate headers and keys from in-memory buffers
+        for (size_t i = 0; i < n; ++i) {
+            const auto& plan = read_plans[i];
+            RecordHeader header;
+            std::memcpy(&header.key_len, hk_bufs[i].data(),
+                        sizeof(header.key_len));
+            std::memcpy(&header.value_len,
+                        hk_bufs[i].data() + sizeof(header.key_len),
+                        sizeof(header.value_len));
 
-        // Read key from disk
-        std::string stored_key(header.key_len, '\0');
-        iovec key_iov = {stored_key.data(), header.key_len};
-        auto read_key_result = data_file_->vector_read(
-            &key_iov, 1, plan.offset + RecordHeader::SIZE);
-        if (!read_key_result) {
-            LOG(ERROR) << "Failed to read key for: " << plan.key
-                       << ", error: " << read_key_result.error();
-            return tl::make_unexpected(read_key_result.error());
-        }
+            if (!header.ValidateAgainstMetadata(plan.value_size)) {
+                LOG(ERROR) << "Stored value_len mismatch for key: "
+                           << plan.key << ", metadata: " << plan.value_size
+                           << ", header: " << header.value_len;
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
 
-        if (read_key_result.value() != header.key_len) {
-            LOG(ERROR) << "Key read size mismatch for: " << plan.key;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-
-        // Validate key matches expected
-        auto validate_result = header.ValidateKey(plan.key, stored_key);
-        if (!validate_result) {
-            return tl::make_unexpected(validate_result.error());
-        }
-
-        // Read value into destination slice
-        iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
-        auto read_value_result = data_file_->vector_read(
-            &value_iov, 1, plan.offset + RecordHeader::SIZE + header.key_len);
-        if (!read_value_result) {
-            LOG(ERROR) << "Failed to read value for key: " << plan.key
-                       << ", error: " << read_value_result.error();
-            return tl::make_unexpected(read_value_result.error());
-        }
-
-        if (read_value_result.value() != header.value_len) {
-            LOG(ERROR) << "Value read size mismatch for key: " << plan.key
-                       << ", expected: " << header.value_len
-                       << ", got: " << read_value_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            std::string stored_key(
+                hk_bufs[i].data() + RecordHeader::SIZE, header.key_len);
+            auto validate_result =
+                header.ValidateKey(plan.key, stored_key);
+            if (!validate_result) {
+                return tl::make_unexpected(validate_result.error());
+            }
         }
     }
 

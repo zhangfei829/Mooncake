@@ -223,4 +223,87 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_read(const iovec *iov,
     return total;
 }
 
+// ---------------------------------------------------------------------------
+// Batch pipelined read — submit all reads via SubmitIoBatchAsync, wait all.
+// ---------------------------------------------------------------------------
+tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
+    const BatchReadEntry *entries, int count) {
+    if (error_code_ != ErrorCode::OK) {
+        return tl::make_unexpected(error_code_);
+    }
+    if (count <= 0) return {};
+
+    auto &env = SpdkEnv::Instance();
+
+    struct ReadCtx {
+        void *dma_buf;
+        size_t aligned_len;
+        size_t skip;
+        size_t total;
+    };
+
+    auto ctxs = std::make_unique<ReadCtx[]>(count);
+    auto reqs = std::make_unique<SpdkIoRequest[]>(count);
+    auto ptrs = std::make_unique<SpdkIoRequest *[]>(count);
+
+    for (int i = 0; i < count; ++i) {
+        size_t total = 0;
+        for (int j = 0; j < entries[i].iovcnt; ++j)
+            total += entries[i].iov[j].iov_len;
+
+        uint64_t abs_off =
+            base_offset_ + static_cast<uint64_t>(entries[i].offset);
+        size_t aligned_off =
+            abs_off & ~(static_cast<size_t>(block_size_) - 1);
+        size_t skip = abs_off - aligned_off;
+        size_t aligned_len = align_up(total + skip);
+
+        void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+        if (!dma_buf) {
+            for (int j = 0; j < i; ++j) env.DmaFree(ctxs[j].dma_buf);
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+
+        ctxs[i] = {dma_buf, aligned_len, skip, total};
+        reqs[i].op = SpdkIoRequest::READ;
+        reqs[i].buf = dma_buf;
+        reqs[i].offset = aligned_off;
+        reqs[i].nbytes = aligned_len;
+        reqs[i].src_data = nullptr;
+        reqs[i].src_iov = nullptr;
+        reqs[i].src_iovcnt = 0;
+        ptrs[i] = &reqs[i];
+    }
+
+    env.SubmitIoBatchAsync(ptrs.get(), count);
+
+    for (int i = 0; i < count; ++i) {
+        while (!reqs[i].completed.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#else
+            std::this_thread::yield();
+#endif
+        }
+    }
+
+    bool all_ok = true;
+    for (int i = 0; i < count; ++i) {
+        if (!reqs[i].success) { all_ok = false; break; }
+        const char *src =
+            static_cast<const char *>(ctxs[i].dma_buf) + ctxs[i].skip;
+        for (int j = 0; j < entries[i].iovcnt; ++j) {
+            std::memcpy(entries[i].iov[j].iov_base, src,
+                        entries[i].iov[j].iov_len);
+            src += entries[i].iov[j].iov_len;
+        }
+    }
+
+    for (int i = 0; i < count; ++i) env.DmaFree(ctxs[i].dma_buf);
+
+    if (!all_ok)
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    return {};
+}
+
 }  // namespace mooncake

@@ -126,6 +126,22 @@ class StorageFile {
                                                         int iovcnt,
                                                         off_t offset) = 0;
 
+    struct BatchReadEntry {
+        const iovec *iov;
+        int iovcnt;
+        off_t offset;
+    };
+
+    virtual tl::expected<void, ErrorCode> vector_read_batch(
+        const BatchReadEntry *entries, int count) {
+        for (int i = 0; i < count; ++i) {
+            auto r = vector_read(entries[i].iov, entries[i].iovcnt,
+                                 entries[i].offset);
+            if (!r) return tl::make_unexpected(r.error());
+        }
+        return {};
+    }
+
     template <typename T>
     tl::expected<T, ErrorCode> make_error(ErrorCode code) {
         error_code_ = code;
@@ -269,6 +285,9 @@ class SpdkFile : public StorageFile {
                                                  off_t offset) override;
     tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
                                                 off_t offset) override;
+
+    tl::expected<void, ErrorCode> vector_read_batch(
+        const BatchReadEntry *entries, int count) override;
 
    private:
     static constexpr size_t BLOCK_ALIGN = 4096;
