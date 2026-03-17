@@ -9,6 +9,8 @@
 #include <thread>
 #include <vector>
 
+#include <sys/uio.h>
+
 namespace mooncake { class SpdkEnv; }
 
 void bdev_init_complete_cb(void *ctx, int rc);
@@ -44,6 +46,11 @@ struct SpdkIoRequest {
     bool success = false;
 
     void *_io_channel = nullptr;
+
+    const void *src_data = nullptr;
+    uint64_t src_len = 0;
+    const struct iovec *src_iov = nullptr;
+    int src_iovcnt = 0;
 };
 
 struct ReactorCtx {

@@ -77,17 +77,13 @@ tl::expected<size_t, ErrorCode> SpdkFile::write(std::span<const char> data,
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    std::memcpy(dma_buf, data.data(), length);
-    if (aligned_len > length) {
-        std::memset(static_cast<char *>(dma_buf) + length, 0,
-                    aligned_len - length);
-    }
-
     SpdkIoRequest req;
     req.op = SpdkIoRequest::WRITE;
     req.buf = dma_buf;
     req.offset = base_offset_ + current_offset_;
     req.nbytes = aligned_len;
+    req.src_data = data.data();
+    req.src_len = length;
     SpdkEnv::Instance().SubmitIo(&req);
 
     if (!req.success) {
@@ -155,15 +151,6 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_write(const iovec *iov,
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    char *dst = static_cast<char *>(dma_buf);
-    for (int i = 0; i < iovcnt; ++i) {
-        std::memcpy(dst, iov[i].iov_base, iov[i].iov_len);
-        dst += iov[i].iov_len;
-    }
-    if (aligned_len > total) {
-        std::memset(dst, 0, aligned_len - total);
-    }
-
     uint64_t abs_offset =
         base_offset_ + static_cast<uint64_t>(offset);
     size_t aligned_offset = abs_offset & ~(static_cast<size_t>(block_size_) - 1);
@@ -178,6 +165,8 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_write(const iovec *iov,
     req.buf = dma_buf;
     req.offset = aligned_offset;
     req.nbytes = aligned_len;
+    req.src_iov = iov;
+    req.src_iovcnt = iovcnt;
     SpdkEnv::Instance().SubmitIo(&req);
 
     if (!req.success) {

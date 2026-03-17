@@ -46,6 +46,26 @@ void execute_io_cb(void *ctx) {
         r->completed.store(true, std::memory_order_release);
     };
 
+    if (req->op == mooncake::SpdkIoRequest::WRITE) {
+        if (req->src_iov && req->src_iovcnt > 0) {
+            char *dst = static_cast<char *>(req->buf);
+            size_t copied = 0;
+            for (int i = 0; i < req->src_iovcnt; ++i) {
+                std::memcpy(dst, req->src_iov[i].iov_base,
+                            req->src_iov[i].iov_len);
+                dst += req->src_iov[i].iov_len;
+                copied += req->src_iov[i].iov_len;
+            }
+            if (req->nbytes > copied)
+                std::memset(dst, 0, req->nbytes - copied);
+        } else if (req->src_data) {
+            std::memcpy(req->buf, req->src_data, req->src_len);
+            if (req->nbytes > req->src_len)
+                std::memset(static_cast<char *>(req->buf) + req->src_len, 0,
+                            req->nbytes - req->src_len);
+        }
+    }
+
     auto *ch = SPDK_CHAN(req->_io_channel);
     int rc;
     if (req->op == mooncake::SpdkIoRequest::WRITE) {

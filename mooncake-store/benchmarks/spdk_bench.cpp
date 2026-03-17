@@ -298,6 +298,14 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
         }
     }
 
+    auto src_bufs = std::make_unique<std::vector<char>[]>(iodepth);
+    if (is_write) {
+        for (int i = 0; i < iodepth; ++i) {
+            src_bufs[i].resize(chunk_size);
+            FillPattern(src_bufs[i].data(), chunk_size, static_cast<uint32_t>(i));
+        }
+    }
+
     BandwidthResult result;
     size_t total_ops = total_bytes / chunk_size;
     size_t submitted = 0, completed = 0;
@@ -315,20 +323,21 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
                submitted < total_ops) {
             int slot = head;
 
-            if (is_write) {
-                FillPattern(static_cast<char *>(dma_bufs[slot]), chunk_size,
-                            static_cast<uint32_t>(submit_offset));
-                if (aligned_chunk > chunk_size)
-                    std::memset(static_cast<char *>(dma_bufs[slot]) +
-                                    chunk_size,
-                                0, aligned_chunk - chunk_size);
-            }
-
             reqs[slot].op =
                 is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
             reqs[slot].buf = dma_bufs[slot];
             reqs[slot].offset = submit_offset;
             reqs[slot].nbytes = aligned_chunk;
+
+            if (is_write) {
+                reqs[slot].src_data = src_bufs[slot].data();
+                reqs[slot].src_len = chunk_size;
+            } else {
+                reqs[slot].src_data = nullptr;
+                reqs[slot].src_len = 0;
+            }
+            reqs[slot].src_iov = nullptr;
+            reqs[slot].src_iovcnt = 0;
 
             int rc = env.SubmitIoAsync(&reqs[slot]);
             if (rc != 0) {
@@ -394,6 +403,14 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
         }
     }
 
+    auto src_bufs = std::make_unique<std::vector<char>[]>(iodepth);
+    if (is_write) {
+        for (int i = 0; i < iodepth; ++i) {
+            src_bufs[i].resize(io_size);
+            FillPattern(src_bufs[i].data(), io_size, static_cast<uint32_t>(i));
+        }
+    }
+
     size_t block_align = 4096;
     size_t max_off = (file_size - io_size) / block_align * block_align;
     std::mt19937 gen(12345);
@@ -414,15 +431,21 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
             int slot = head;
             off_t off = offsets[submitted];
 
-            if (is_write)
-                FillPattern(static_cast<char *>(dma_bufs[slot]), io_size,
-                            static_cast<uint32_t>(off ^ submitted));
-
             reqs[slot].op =
                 is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
             reqs[slot].buf = dma_bufs[slot];
             reqs[slot].offset = off;
             reqs[slot].nbytes = aligned_io;
+
+            if (is_write) {
+                reqs[slot].src_data = src_bufs[slot].data();
+                reqs[slot].src_len = io_size;
+            } else {
+                reqs[slot].src_data = nullptr;
+                reqs[slot].src_len = 0;
+            }
+            reqs[slot].src_iov = nullptr;
+            reqs[slot].src_iovcnt = 0;
 
             int rc = env.SubmitIoAsync(&reqs[slot]);
             if (rc != 0) {
