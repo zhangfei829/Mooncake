@@ -327,6 +327,31 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
                 config_.malloc_block_size);
             fclose(f);
         }
+    } else if (!config_.nvme_pci_addr.empty()) {
+        json_path = "/tmp/mooncake_spdk_nvme_bdev.json";
+        FILE *f = fopen(json_path.c_str(), "w");
+        if (f) {
+            fprintf(f,
+                "{\n"
+                "  \"subsystems\": [{\n"
+                "    \"subsystem\": \"bdev\",\n"
+                "    \"config\": [{\n"
+                "      \"method\": \"bdev_nvme_attach_controller\",\n"
+                "      \"params\": {\n"
+                "        \"name\": \"%s\",\n"
+                "        \"trtype\": \"PCIe\",\n"
+                "        \"traddr\": \"%s\"\n"
+                "      }\n"
+                "    }]\n"
+                "  }]\n"
+                "}\n",
+                config_.nvme_ctrl_name.c_str(),
+                config_.nvme_pci_addr.c_str());
+            fclose(f);
+            LOG(INFO) << "SpdkEnv: NVMe bdev JSON written — ctrl="
+                      << config_.nvme_ctrl_name << " traddr="
+                      << config_.nvme_pci_addr;
+        }
     }
 
     reactor_thread_ = std::thread([this, json_path]() {

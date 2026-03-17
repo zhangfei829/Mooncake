@@ -65,6 +65,15 @@ DEFINE_int32(cores, 8,
              "Number of SPDK reactor cores (default: 8)");
 DEFINE_bool(profile, false,
             "Enable per-phase timing breakdown (pass --v=1 for backend detail)");
+DEFINE_string(nvme_pci_addr, "",
+              "NVMe PCI BDF address for real disk (e.g. 0000:47:00.0). "
+              "When set, uses real NVMe bdev instead of malloc bdev.");
+DEFINE_bool(posix_direct, false,
+            "Use O_DIRECT for Posix file I/O (bypasses page cache, "
+            "fairer comparison vs SPDK on real disk)");
+DEFINE_string(posix_backend_dir, "",
+              "Directory for Posix backend tests (default: /tmp). "
+              "Set to a mount point on real NVMe for fair disk comparison.");
 
 // ============================================================================
 // Helpers
@@ -96,6 +105,29 @@ static std::string FormatBW(double bytes, double secs) {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "%.1f MB/s", mbps);
     return buf;
+}
+
+// 4096-aligned buffer for O_DIRECT compatibility.
+struct AlignedBuf {
+    char *ptr = nullptr;
+    size_t len = 0;
+
+    explicit AlignedBuf(size_t n) : len(n) {
+        size_t aligned_n = (n + 4095) & ~size_t(4095);
+        ptr = static_cast<char *>(aligned_alloc(4096, aligned_n));
+    }
+    ~AlignedBuf() { free(ptr); }
+    AlignedBuf(const AlignedBuf &) = delete;
+    AlignedBuf &operator=(const AlignedBuf &) = delete;
+    char *data() { return ptr; }
+    size_t size() const { return len; }
+};
+
+static int OpenPosixFlags(bool create) {
+    int flags = O_RDWR | O_CLOEXEC;
+    if (create) flags |= O_CREAT | O_TRUNC;
+    if (FLAGS_posix_direct) flags |= O_DIRECT;
+    return flags;
 }
 
 struct LatencyStats {
@@ -161,10 +193,8 @@ static BandwidthResult BenchFileSeq(StorageFile &file, size_t chunk_size,
     size_t remaining = total_bytes;
     off_t offset = 0;
 
-    // Pre-allocate buffers once outside the hot loop
-    std::vector<char> buf(chunk_size);
-    std::vector<char> verify_buf;
-    if (do_verify) verify_buf.resize(chunk_size);
+    AlignedBuf buf(chunk_size);
+    AlignedBuf verify_buf(do_verify ? chunk_size : 0);
 
     auto wall_t0 = Clock::now();
 
@@ -234,7 +264,7 @@ static BandwidthResult BenchFileRand(StorageFile &file, size_t io_size,
     std::mt19937 gen(12345);
     std::uniform_int_distribution<size_t> dist(0, max_offset / block_align);
 
-    std::vector<char> buf(io_size);
+    AlignedBuf buf(io_size);
 
     auto wall_t0 = Clock::now();
 
@@ -708,10 +738,16 @@ static void PrintLatencyRow(const std::string &label,
 // ============================================================================
 
 static void RunFileSeqBench() {
+    auto &env = SpdkEnv::Instance();
+    const char *spdk_mode = FLAGS_nvme_pci_addr.empty() ? "malloc" : "NVMe";
+    const char *posix_mode = FLAGS_posix_direct ? "O_DIRECT" : "cached";
+
     std::cout << "\n";
     PrintSeparator();
-    std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (cores="
-              << FLAGS_cores << ", iodepth=" << FLAGS_iodepth
+    std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (SPDK=" << spdk_mode
+              << ", Posix=" << posix_mode
+              << ", cores=" << FLAGS_cores
+              << ", iodepth=" << FLAGS_iodepth
               << ", iterations=" << FLAGS_iterations << ")\n";
     PrintSeparator();
 
@@ -720,10 +756,11 @@ static void RunFileSeqBench() {
         4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024,
         32 * 1024 * 1024, 64 * 1024 * 1024};
 
-    size_t total_data = FLAGS_spdk_malloc_mb * 1024ULL * 1024 / 2;
-
-    auto &env = SpdkEnv::Instance();
     uint64_t bdev_size = env.GetBdevSize();
+    size_t total_data = bdev_size / 2;
+    if (total_data > 512ULL * 1024 * 1024)
+        total_data = 512ULL * 1024 * 1024;
+
     int nc = env.GetNumReactors();
 
     char hdr[256];
@@ -751,10 +788,11 @@ static void RunFileSeqBench() {
 
             // --- Posix (sync preadv/pwritev) ---
             {
-                int flags = O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC;
-                int fd = open(FLAGS_posix_path.c_str(), flags, 0644);
+                int fd = open(FLAGS_posix_path.c_str(),
+                              OpenPosixFlags(true), 0644);
                 if (fd < 0) {
-                    LOG(ERROR) << "Cannot open " << FLAGS_posix_path;
+                    LOG(ERROR) << "Cannot open " << FLAGS_posix_path
+                               << " errno=" << errno;
                     return;
                 }
                 if (ftruncate(fd, effective_total) != 0) {
@@ -811,16 +849,23 @@ static void RunFileSeqBench() {
 // ============================================================================
 
 static void RunFileRandBench() {
+    auto &env = SpdkEnv::Instance();
+    const char *spdk_mode = FLAGS_nvme_pci_addr.empty() ? "malloc" : "NVMe";
+    const char *posix_mode = FLAGS_posix_direct ? "O_DIRECT" : "cached";
+
     std::cout << "\n";
     PrintSeparator();
-    std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, cores="
-              << FLAGS_cores << ", iodepth=" << FLAGS_iodepth
+    std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, SPDK=" << spdk_mode
+              << ", Posix=" << posix_mode
+              << ", cores=" << FLAGS_cores
+              << ", iodepth=" << FLAGS_iodepth
               << ", iterations=" << FLAGS_iterations << ")\n";
     PrintSeparator();
 
-    auto &env = SpdkEnv::Instance();
     uint64_t bdev_size = env.GetBdevSize();
-    size_t file_size = FLAGS_spdk_malloc_mb * 1024ULL * 1024 / 2;
+    size_t file_size = bdev_size / 2;
+    if (file_size > 512ULL * 1024 * 1024)
+        file_size = 512ULL * 1024 * 1024;
     int nc = env.GetNumReactors();
 
     std::vector<int> ops_list = {10000, 50000, 200000};
@@ -841,7 +886,7 @@ static void RunFileRandBench() {
             // Pre-fill Posix
             {
                 int fd = open(FLAGS_posix_path.c_str(),
-                              O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+                              OpenPosixFlags(true), 0644);
                 if (fd >= 0) {
                     ftruncate(fd, file_size);
                     PosixFile pf(FLAGS_posix_path, fd);
@@ -856,7 +901,7 @@ static void RunFileRandBench() {
             // Posix random (sync)
             {
                 int fd = open(FLAGS_posix_path.c_str(),
-                              O_RDWR | O_CLOEXEC, 0644);
+                              OpenPosixFlags(false), 0644);
                 PosixFile pf(FLAGS_posix_path, fd);
                 auto wr = BenchFileRand(pf, 4096, file_size, num_ops, true);
                 auto rd = BenchFileRand(pf, 4096, file_size, num_ops, false);
@@ -912,7 +957,7 @@ static void RunFileRandBench() {
 
     {
         int fd = open(FLAGS_posix_path.c_str(),
-                      O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+                      OpenPosixFlags(true), 0644);
         ftruncate(fd, file_size);
         PosixFile pf(FLAGS_posix_path, fd);
         BenchFileSeq(pf, 1024 * 1024, file_size, true, false);
@@ -944,8 +989,10 @@ static void RunFileRandBench() {
 static void RunBackendBench() {
     std::cout << "\n";
     PrintSeparator();
+    const char *spdk_mode = FLAGS_nvme_pci_addr.empty() ? "malloc" : "NVMe";
     std::cout << "  BACKEND THROUGHPUT: OffsetAllocatorStorageBackend"
-              << "  (keys=" << FLAGS_backend_keys
+              << "  (SPDK=" << spdk_mode
+              << ", keys=" << FLAGS_backend_keys
               << ", value=" << FLAGS_backend_value_kb << "KB"
               << ", threads=" << FLAGS_threads
               << ", iterations=" << FLAGS_iterations << ")\n";
@@ -954,8 +1001,10 @@ static void RunBackendBench() {
     namespace fs = std::filesystem;
     auto &env = SpdkEnv::Instance();
 
-    std::string posix_dir =
-        (fs::temp_directory_path() / "spdk_bench_posix").string();
+    fs::path posix_base = FLAGS_posix_backend_dir.empty()
+                              ? fs::temp_directory_path()
+                              : fs::path(FLAGS_posix_backend_dir);
+    std::string posix_dir = (posix_base / "spdk_bench_posix").string();
     std::string spdk_dir =
         (fs::temp_directory_path() / "spdk_bench_spdk").string();
 
@@ -1046,7 +1095,8 @@ static void RunBackendBench() {
     // Multi-value-size sweep
     std::cout << "\n";
     PrintSeparator();
-    std::cout << "  VALUE SIZE SWEEP  (max_keys=" << num_keys
+    std::cout << "  VALUE SIZE SWEEP  (SPDK=" << spdk_mode
+              << ", max_keys=" << num_keys
               << ", threads=" << threads
               << ", bdev=" << FormatSize(env.GetBdevSize()) << ")\n";
     PrintSeparator(120);
@@ -1155,16 +1205,28 @@ int main(int argc, char **argv) {
 
     // Init SPDK
     SpdkEnvConfig cfg;
-    cfg.bdev_name = FLAGS_spdk_bdev_name;
-    cfg.use_malloc_bdev = true;
-    cfg.malloc_num_blocks =
-        (FLAGS_spdk_malloc_mb * 1024ULL * 1024) / 4096;
-    cfg.malloc_block_size = 4096;
     cfg.reactor_mask = BuildCoreMask(FLAGS_cores);
 
-    std::cout << "Initializing SPDK (malloc bdev "
-              << FLAGS_spdk_malloc_mb << " MB, cores="
-              << FLAGS_cores << ", mask=" << cfg.reactor_mask << ")...\n";
+    if (!FLAGS_nvme_pci_addr.empty()) {
+        cfg.use_malloc_bdev = false;
+        cfg.nvme_pci_addr = FLAGS_nvme_pci_addr;
+        cfg.bdev_name = cfg.nvme_ctrl_name + "n1";
+        FLAGS_spdk_bdev_name = cfg.bdev_name;
+        std::cout << "Initializing SPDK (NVMe PCIe traddr="
+                  << FLAGS_nvme_pci_addr << ", bdev=" << cfg.bdev_name
+                  << ", cores=" << FLAGS_cores
+                  << ", mask=" << cfg.reactor_mask << ")...\n";
+    } else {
+        cfg.bdev_name = FLAGS_spdk_bdev_name;
+        cfg.use_malloc_bdev = true;
+        cfg.malloc_num_blocks =
+            (FLAGS_spdk_malloc_mb * 1024ULL * 1024) / 4096;
+        cfg.malloc_block_size = 4096;
+        std::cout << "Initializing SPDK (malloc bdev "
+                  << FLAGS_spdk_malloc_mb << " MB, cores="
+                  << FLAGS_cores << ", mask=" << cfg.reactor_mask << ")...\n";
+    }
+
     int rc = SpdkEnv::Instance().Init(cfg);
     if (rc != 0) {
         LOG(FATAL) << "SpdkEnv::Init failed rc=" << rc;

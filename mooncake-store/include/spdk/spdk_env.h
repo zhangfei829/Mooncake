@@ -33,6 +33,12 @@ struct SpdkEnvConfig {
     uint64_t malloc_num_blocks = 131072;
     uint32_t malloc_block_size = 4096;
 
+    // Real NVMe: PCI BDF address (e.g. "0000:47:00.0").
+    // When non-empty and use_malloc_bdev==false, an NVMe bdev is attached.
+    // The resulting bdev name is "<nvme_ctrl_name>n1".
+    std::string nvme_pci_addr;
+    std::string nvme_ctrl_name = "NVMe0";
+
     std::string reactor_mask = "0x1";
 };
 
