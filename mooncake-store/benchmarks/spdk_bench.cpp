@@ -300,8 +300,11 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
 
     auto src_bufs = std::make_unique<std::vector<char>[]>(iodepth);
     if (is_write) {
-        for (int i = 0; i < iodepth; ++i)
+        for (int i = 0; i < iodepth; ++i) {
             src_bufs[i].resize(chunk_size);
+            FillPattern(src_bufs[i].data(), chunk_size,
+                        static_cast<uint32_t>(i));
+        }
     }
 
     BandwidthResult result;
@@ -328,8 +331,6 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
             reqs[slot].nbytes = aligned_chunk;
 
             if (is_write) {
-                FillPattern(src_bufs[slot].data(), chunk_size,
-                            static_cast<uint32_t>(submit_offset));
                 reqs[slot].src_data = src_bufs[slot].data();
                 reqs[slot].src_len = chunk_size;
             } else {
@@ -358,12 +359,14 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
             if (!reqs[tail].completed.load(std::memory_order_acquire)) break;
 
             if (!is_write && do_verify && reqs[tail].success) {
-                off_t chk = static_cast<off_t>(completed * chunk_size);
+                int expected_slot =
+                    static_cast<int>(completed % static_cast<size_t>(iodepth));
                 FillPattern(verify_buf.data(), chunk_size,
-                            static_cast<uint32_t>(chk));
+                            static_cast<uint32_t>(expected_slot));
                 if (std::memcmp(dma_bufs[tail], verify_buf.data(),
                                 chunk_size) != 0) {
-                    LOG(ERROR) << "Async verify FAILED at offset " << chk;
+                    LOG(ERROR) << "Async verify FAILED at offset "
+                               << completed * chunk_size;
                 }
             }
 
@@ -405,8 +408,11 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
 
     auto src_bufs = std::make_unique<std::vector<char>[]>(iodepth);
     if (is_write) {
-        for (int i = 0; i < iodepth; ++i)
+        for (int i = 0; i < iodepth; ++i) {
             src_bufs[i].resize(io_size);
+            FillPattern(src_bufs[i].data(), io_size,
+                        static_cast<uint32_t>(i));
+        }
     }
 
     size_t block_align = 4096;
@@ -436,8 +442,6 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
             reqs[slot].nbytes = aligned_io;
 
             if (is_write) {
-                FillPattern(src_bufs[slot].data(), io_size,
-                            static_cast<uint32_t>(off ^ submitted));
                 reqs[slot].src_data = src_bufs[slot].data();
                 reqs[slot].src_len = io_size;
             } else {
