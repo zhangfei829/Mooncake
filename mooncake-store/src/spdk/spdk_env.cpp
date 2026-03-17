@@ -531,4 +531,47 @@ void SpdkEnv::DmaPoolFree(void *buf, size_t size) {
     dma_pool_.push_back({buf, size});
 }
 
+int SpdkEnv::DmaPoolAllocBatch(void **out_bufs, size_t needed, int count,
+                                size_t align) {
+    int got = 0;
+    {
+        std::lock_guard<std::mutex> lk(dma_pool_mutex_);
+        for (int i = static_cast<int>(dma_pool_.size()) - 1;
+             i >= 0 && got < count; --i) {
+            if (dma_pool_[i].size >= needed) {
+                out_bufs[got++] = dma_pool_[i].buf;
+                dma_pool_[i] = dma_pool_.back();
+                dma_pool_.pop_back();
+            }
+        }
+    }
+    for (int i = got; i < count; ++i) {
+        out_bufs[i] = spdk_dma_malloc(needed, align, nullptr);
+        if (!out_bufs[i]) return i;
+        ++got;
+    }
+    return got;
+}
+
+void SpdkEnv::DmaPoolFreeBatch(void *const *bufs, size_t size, int count) {
+    std::lock_guard<std::mutex> lk(dma_pool_mutex_);
+    dma_pool_.reserve(dma_pool_.size() + count);
+    for (int i = 0; i < count; ++i)
+        dma_pool_.push_back({bufs[i], size});
+}
+
+void SpdkEnv::DmaPoolPrewarm(size_t buf_size, int count, size_t align) {
+    auto bufs = std::make_unique<void *[]>(count);
+    int ok = 0;
+    for (int i = 0; i < count; ++i) {
+        bufs[i] = spdk_dma_malloc(buf_size, align, nullptr);
+        if (!bufs[i]) break;
+        ++ok;
+    }
+    if (ok > 0)
+        DmaPoolFreeBatch(bufs.get(), buf_size, ok);
+    LOG(INFO) << "SpdkEnv: DMA pool pre-warmed " << ok << " × "
+              << buf_size << " bytes";
+}
+
 }  // namespace mooncake

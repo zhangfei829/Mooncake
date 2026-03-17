@@ -2586,6 +2586,9 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
+    using ProfClock = std::chrono::high_resolution_clock;
+    auto prof_t0 = ProfClock::now();
+
     // ---- Phase 1a: Prepare all writes (allocate offsets) ----
     struct WritePlan {
         std::string key;
@@ -2653,6 +2656,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             plan.iovs.push_back({slice.ptr, slice.size});
     }
 
+    auto prof_t1 = ProfClock::now();
+
     // ---- Phase 2: Batch I/O — submit all writes at once ----
     if (!write_plans.empty()) {
         const size_t n = write_plans.size();
@@ -2670,6 +2675,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             return tl::make_unexpected(batch_result.error());
         }
     }
+
+    auto prof_t2 = ProfClock::now();
 
     // ---- Phase 3: Update metadata for all successful writes ----
     for (auto& plan : write_plans) {
@@ -2704,6 +2711,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             static_cast<int64_t>(plan.value_size), ""});
     }
 
+    auto prof_t3 = ProfClock::now();
+
     // Invoke complete handler only if we have successful keys to report
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
@@ -2718,6 +2727,17 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         }
     }
 
+    VLOG(1) << "BatchOffload profile (" << write_plans.size() << " keys): "
+            << "prepare="
+            << std::chrono::duration<double, std::micro>(prof_t1 - prof_t0).count()
+            << "us io="
+            << std::chrono::duration<double, std::micro>(prof_t2 - prof_t1).count()
+            << "us meta="
+            << std::chrono::duration<double, std::micro>(prof_t3 - prof_t2).count()
+            << "us total="
+            << std::chrono::duration<double, std::micro>(prof_t3 - prof_t0).count()
+            << "us";
+
     return static_cast<int64_t>(keys.size());
 }
 
@@ -2730,6 +2750,9 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             << "Storage backend is not initialized. Call Init() before use.";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
+
+    using ProfClock2 = std::chrono::high_resolution_clock;
+    auto prof_l0 = ProfClock2::now();
 
     // Step 1: Build read plan by copying metadata under shard locks
     // No locks held during actual disk I/O
@@ -2775,6 +2798,8 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
 
         // Lock released here; allocation stays alive via shared_ptr
     }
+
+    auto prof_l1 = ProfClock2::now();
 
     // Step 2: Perform disk I/O without holding any locks.
     // Merge header+key+value into a single read per key and batch all reads.
@@ -2834,8 +2859,19 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         }
     }
 
+    auto prof_l2 = ProfClock2::now();
+
     // read_plans destructor releases all AllocationPtr references
     // Physical extents freed only when last reference drops
+
+    VLOG(1) << "BatchLoad profile (" << read_plans.size() << " keys): "
+            << "meta="
+            << std::chrono::duration<double, std::micro>(prof_l1 - prof_l0).count()
+            << "us io+validate="
+            << std::chrono::duration<double, std::micro>(prof_l2 - prof_l1).count()
+            << "us total="
+            << std::chrono::duration<double, std::micro>(prof_l2 - prof_l0).count()
+            << "us";
 
     return {};
 }

@@ -226,6 +226,9 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_read(const iovec *iov,
 // ---------------------------------------------------------------------------
 // Batch pipelined write — submit all writes via SubmitIoBatchAsync, wait all.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Batch pipelined write — continuous pipeline with fixed DMA window.
+// ---------------------------------------------------------------------------
 tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
     const BatchWriteEntry *entries, int count) {
     if (error_code_ != ErrorCode::OK) {
@@ -235,71 +238,88 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
 
     auto &env = SpdkEnv::Instance();
 
-    struct WriteCtx {
-        void *dma_buf;
-        size_t alloc_len;
-    };
-
-    auto ctxs = std::make_unique<WriteCtx[]>(count);
-    auto reqs = std::make_unique<SpdkIoRequest[]>(count);
-    auto ptrs = std::make_unique<SpdkIoRequest *[]>(count);
-
+    size_t max_aligned = 0;
     for (int i = 0; i < count; ++i) {
         size_t total = 0;
         for (int j = 0; j < entries[i].iovcnt; ++j)
             total += entries[i].iov[j].iov_len;
+        size_t al = align_up(total);
+        if (al > max_aligned) max_aligned = al;
+    }
 
-        uint64_t abs_off =
-            base_offset_ + static_cast<uint64_t>(entries[i].offset);
-        size_t aligned_off =
-            abs_off & ~(static_cast<size_t>(block_size_) - 1);
-        size_t aligned_len = align_up(total);
+    int qd = std::min(count, 128);
 
-        void *dma_buf = env.DmaPoolAlloc(aligned_len, block_size_);
-        if (!dma_buf) {
-            for (int j = 0; j < i; ++j)
-                env.DmaPoolFree(ctxs[j].dma_buf, ctxs[j].alloc_len);
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    auto dma_bufs = std::make_unique<void *[]>(qd);
+    int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
+                                    block_size_);
+    if (got < qd) {
+        for (int j = 0; j < got; ++j)
+            env.DmaPoolFree(dma_bufs[j], max_aligned);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
+    auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
+
+    int submitted = 0, completed = 0;
+    int head = 0, tail = 0;
+    ErrorCode first_err = ErrorCode::OK;
+
+    while (completed < count) {
+        int batch_count = 0;
+        while (submitted - completed < qd && submitted < count) {
+            int slot = head;
+            int idx = submitted;
+
+            size_t total = 0;
+            for (int j = 0; j < entries[idx].iovcnt; ++j)
+                total += entries[idx].iov[j].iov_len;
+
+            uint64_t abs_off =
+                base_offset_ + static_cast<uint64_t>(entries[idx].offset);
+            size_t aligned_off =
+                abs_off & ~(static_cast<size_t>(block_size_) - 1);
+            size_t al = align_up(total);
+
+            reqs[slot].op = SpdkIoRequest::WRITE;
+            reqs[slot].buf = dma_bufs[slot];
+            reqs[slot].offset = aligned_off;
+            reqs[slot].nbytes = al;
+            reqs[slot].src_iov = entries[idx].iov;
+            reqs[slot].src_iovcnt = entries[idx].iovcnt;
+            reqs[slot].src_data = nullptr;
+            reqs[slot].src_len = 0;
+            reqs[slot].dst_iov = nullptr;
+            reqs[slot].dst_iovcnt = 0;
+
+            batch_ptrs[batch_count++] = &reqs[slot];
+            submitted++;
+            head = (head + 1) % qd;
         }
 
-        ctxs[i] = {dma_buf, aligned_len};
-        reqs[i].op = SpdkIoRequest::WRITE;
-        reqs[i].buf = dma_buf;
-        reqs[i].offset = aligned_off;
-        reqs[i].nbytes = aligned_len;
-        reqs[i].src_iov = entries[i].iov;
-        reqs[i].src_iovcnt = entries[i].iovcnt;
-        reqs[i].src_data = nullptr;
-        reqs[i].src_len = 0;
-        reqs[i].dst_iov = nullptr;
-        reqs[i].dst_iovcnt = 0;
-        ptrs[i] = &reqs[i];
-    }
+        if (batch_count > 0)
+            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
 
-    env.SubmitIoBatchAsync(ptrs.get(), count);
-
-    for (int i = 0; i < count; ++i) {
-        while (!reqs[i].completed.load(std::memory_order_acquire)) {
-#if defined(__x86_64__) || defined(_M_X64)
-            __builtin_ia32_pause();
-#else
-            std::this_thread::yield();
-#endif
+        while (completed < submitted) {
+            if (!reqs[tail].completed.load(std::memory_order_acquire))
+                break;
+            if (!reqs[tail].success && first_err == ErrorCode::OK)
+                first_err = ErrorCode::FILE_WRITE_FAIL;
+            completed++;
+            tail = (tail + 1) % qd;
         }
     }
 
-    for (int i = 0; i < count; ++i)
-        env.DmaPoolFree(ctxs[i].dma_buf, ctxs[i].alloc_len);
+    env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
 
-    for (int i = 0; i < count; ++i) {
-        if (!reqs[i].success)
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
+    if (first_err != ErrorCode::OK)
+        return tl::make_unexpected(first_err);
     return {};
 }
 
 // ---------------------------------------------------------------------------
-// Batch pipelined read — submit all reads via SubmitIoBatchAsync, wait all.
+// Batch pipelined read — continuous pipeline with fixed DMA window.
+// Mirrors the file-level benchmark's submit/drain loop so reactors never idle.
 // ---------------------------------------------------------------------------
 tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
     const BatchReadEntry *entries, int count) {
@@ -310,66 +330,87 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
 
     auto &env = SpdkEnv::Instance();
 
-    struct ReadCtx {
-        void *dma_buf;
-        size_t alloc_len;
-        size_t skip;
-    };
-
-    auto ctxs = std::make_unique<ReadCtx[]>(count);
-    auto reqs = std::make_unique<SpdkIoRequest[]>(count);
-    auto ptrs = std::make_unique<SpdkIoRequest *[]>(count);
-
+    size_t max_aligned = 0;
     for (int i = 0; i < count; ++i) {
         size_t total = 0;
         for (int j = 0; j < entries[i].iovcnt; ++j)
             total += entries[i].iov[j].iov_len;
-
         uint64_t abs_off =
             base_offset_ + static_cast<uint64_t>(entries[i].offset);
         size_t aligned_off =
             abs_off & ~(static_cast<size_t>(block_size_) - 1);
         size_t skip = abs_off - aligned_off;
-        size_t aligned_len = align_up(total + skip);
+        size_t al = align_up(total + skip);
+        if (al > max_aligned) max_aligned = al;
+    }
 
-        void *dma_buf = env.DmaPoolAlloc(aligned_len, block_size_);
-        if (!dma_buf) {
-            for (int j = 0; j < i; ++j) env.DmaPoolFree(ctxs[j].dma_buf, ctxs[j].alloc_len);
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    int qd = std::min(count, 128);
+
+    auto dma_bufs = std::make_unique<void *[]>(qd);
+    int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
+                                    block_size_);
+    if (got < qd) {
+        for (int j = 0; j < got; ++j)
+            env.DmaPoolFree(dma_bufs[j], max_aligned);
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
+    auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
+
+    int submitted = 0, completed = 0;
+    int head = 0, tail = 0;
+    ErrorCode first_err = ErrorCode::OK;
+
+    while (completed < count) {
+        int batch_count = 0;
+        while (submitted - completed < qd && submitted < count) {
+            int slot = head;
+            int idx = submitted;
+
+            size_t total = 0;
+            for (int j = 0; j < entries[idx].iovcnt; ++j)
+                total += entries[idx].iov[j].iov_len;
+            uint64_t abs_off =
+                base_offset_ + static_cast<uint64_t>(entries[idx].offset);
+            size_t aligned_off =
+                abs_off & ~(static_cast<size_t>(block_size_) - 1);
+            size_t skip = abs_off - aligned_off;
+            size_t al = align_up(total + skip);
+
+            reqs[slot].op = SpdkIoRequest::READ;
+            reqs[slot].buf = dma_bufs[slot];
+            reqs[slot].offset = aligned_off;
+            reqs[slot].nbytes = al;
+            reqs[slot].src_data = nullptr;
+            reqs[slot].src_iov = nullptr;
+            reqs[slot].src_iovcnt = 0;
+            reqs[slot].dst_iov = entries[idx].iov;
+            reqs[slot].dst_iovcnt = entries[idx].iovcnt;
+            reqs[slot].dst_skip = skip;
+
+            batch_ptrs[batch_count++] = &reqs[slot];
+            submitted++;
+            head = (head + 1) % qd;
         }
 
-        ctxs[i] = {dma_buf, aligned_len, skip};
-        reqs[i].op = SpdkIoRequest::READ;
-        reqs[i].buf = dma_buf;
-        reqs[i].offset = aligned_off;
-        reqs[i].nbytes = aligned_len;
-        reqs[i].src_data = nullptr;
-        reqs[i].src_iov = nullptr;
-        reqs[i].src_iovcnt = 0;
-        reqs[i].dst_iov = entries[i].iov;
-        reqs[i].dst_iovcnt = entries[i].iovcnt;
-        reqs[i].dst_skip = skip;
-        ptrs[i] = &reqs[i];
-    }
+        if (batch_count > 0)
+            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
 
-    env.SubmitIoBatchAsync(ptrs.get(), count);
-
-    for (int i = 0; i < count; ++i) {
-        while (!reqs[i].completed.load(std::memory_order_acquire)) {
-#if defined(__x86_64__) || defined(_M_X64)
-            __builtin_ia32_pause();
-#else
-            std::this_thread::yield();
-#endif
+        while (completed < submitted) {
+            if (!reqs[tail].completed.load(std::memory_order_acquire))
+                break;
+            if (!reqs[tail].success && first_err == ErrorCode::OK)
+                first_err = ErrorCode::FILE_READ_FAIL;
+            completed++;
+            tail = (tail + 1) % qd;
         }
     }
 
-    for (int i = 0; i < count; ++i) env.DmaPoolFree(ctxs[i].dma_buf, ctxs[i].alloc_len);
+    env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
 
-    for (int i = 0; i < count; ++i) {
-        if (!reqs[i].success)
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    }
+    if (first_err != ErrorCode::OK)
+        return tl::make_unexpected(first_err);
     return {};
 }
 

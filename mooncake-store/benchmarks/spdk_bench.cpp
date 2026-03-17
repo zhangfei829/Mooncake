@@ -53,7 +53,7 @@ DEFINE_int32(iterations, 5,
 DEFINE_string(test, "all",
               "Which test to run: file_seq, file_rand, backend, all");
 DEFINE_bool(verify, true, "Verify data correctness on first iteration");
-DEFINE_uint64(backend_keys, 200,
+DEFINE_uint64(backend_keys, 2000,
               "Number of keys for backend throughput test");
 DEFINE_uint64(backend_value_kb, 128,
               "Value size in KB for backend test (default: 128)");
@@ -62,7 +62,9 @@ DEFINE_int32(threads, 1,
 DEFINE_int32(iodepth, 128,
              "I/O queue depth for SPDK async benchmarks (default: 128)");
 DEFINE_int32(cores, 8,
-             "Number of SPDK reactor cores (default: 1)");
+             "Number of SPDK reactor cores (default: 8)");
+DEFINE_bool(profile, false,
+            "Enable per-phase timing breakdown (pass --v=1 for backend detail)");
 
 // ============================================================================
 // Helpers
@@ -587,6 +589,15 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
     double offload_bytes = static_cast<double>(total_written) * value_size;
     result.offload_bw_mbps = (offload_bytes / (1024.0 * 1024.0)) / offload_secs;
 
+    if (FLAGS_profile) {
+        std::cout << "  [profile] Offload: " << num_keys << " keys × "
+                  << FormatSize(value_size)
+                  << "  wall=" << std::fixed << std::setprecision(2)
+                  << offload_secs * 1e6 << "us  BW="
+                  << std::setprecision(1) << result.offload_bw_mbps
+                  << " MB/s\n";
+    }
+
     // --- Load (read) — batch ALL keys per thread to exploit SPDK multi-core ---
     std::vector<LatencyStats> r_latencies(threads);
 
@@ -659,6 +670,15 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
         std::chrono::duration<double>(load_total_t1 - load_total_t0).count();
     double load_bytes = static_cast<double>(total_written) * value_size;
     result.load_bw_mbps = (load_bytes / (1024.0 * 1024.0)) / load_secs;
+
+    if (FLAGS_profile) {
+        std::cout << "  [profile] Load:    " << num_keys << " keys × "
+                  << FormatSize(value_size)
+                  << "  wall=" << std::fixed << std::setprecision(2)
+                  << load_secs * 1e6 << "us  BW="
+                  << std::setprecision(1) << result.load_bw_mbps
+                  << " MB/s\n";
+    }
 
     return result;
 }
@@ -944,6 +964,13 @@ static void RunBackendBench() {
     int threads = FLAGS_threads;
     int iters = FLAGS_iterations;
 
+    // Pre-warm DMA pool for the backend throughput test
+    {
+        size_t warm_size = spdk_align_up(value_size + 4096 + 64);
+        int warm_count = static_cast<int>(num_keys);
+        env.DmaPoolPrewarm(warm_size, warm_count, env.GetBlockSize());
+    }
+
     // Header
     std::cout << std::setw(8) << "Backend"
               << "  │ " << std::setw(14) << "Offload MB/s"
@@ -1033,9 +1060,17 @@ static void RunBackendBench() {
     PrintSeparator(120);
 
     std::vector<size_t> value_sizes = {
-        4096,           32 * 1024,      128 * 1024,      512 * 1024,
-        2 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024,
-        32 * 1024 * 1024, 64 * 1024 * 1024};
+        64 * 1024 * 1024, 32 * 1024 * 1024, 16 * 1024 * 1024,
+        8 * 1024 * 1024, 2 * 1024 * 1024, 512 * 1024,
+        128 * 1024,      32 * 1024,      4096};
+
+    // Pre-warm DMA pool: allocate enough large buffers so that subsequent
+    // vector_write_batch / vector_read_batch never call spdk_dma_malloc.
+    {
+        size_t warm_size = spdk_align_up(value_sizes.front() + 4096 + 64);
+        int warm_count = static_cast<int>(num_keys);
+        env.DmaPoolPrewarm(warm_size, warm_count, env.GetBlockSize());
+    }
 
     for (size_t vsz : value_sizes) {
         uint64_t bdev_cap = env.GetBdevSize();
