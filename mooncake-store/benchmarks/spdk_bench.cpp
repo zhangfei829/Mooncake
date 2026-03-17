@@ -773,10 +773,11 @@ static void RunFileRandBench() {
 
     std::vector<int> ops_list = {10000, 50000, 200000};
 
-    char rhdr[256];
+    char rhdr[512];
     std::snprintf(rhdr, sizeof(rhdr),
-                  "%10s  │ %24s  │  SPDK %dC QD=%-3d IOPS W/R │ %20s",
-                  "NumOps", "Posix IOPS (W / R)", nc, FLAGS_iodepth,
+                  "%10s  │ %24s  │ %24s  │  SPDK %dC QD=%-3d W/R (MB/s) │ %20s",
+                  "NumOps", "Posix IOPS (W / R)",
+                  "Posix W / R (MB/s)", nc, FLAGS_iodepth,
                   "Speedup W / R");
     std::cout << rhdr << "\n";
     PrintSeparator();
@@ -835,12 +836,18 @@ static void RunFileRandBench() {
         double pw = trimmed_mean(pw_iops), pr = trimmed_mean(pr_iops);
         double sw = trimmed_mean(sw_iops), sr = trimmed_mean(sr_iops);
 
-        char row[256];
+        constexpr double kIoSize = 4096.0;
+        constexpr double kMB = 1024.0 * 1024.0;
+        double pw_mb = pw * kIoSize / kMB, pr_mb = pr * kIoSize / kMB;
+        double sw_mb = sw * kIoSize / kMB, sr_mb = sr * kIoSize / kMB;
+
+        char row[512];
         std::snprintf(row, sizeof(row),
-                      "%10d  │  %10.0f / %-10.0f  │  %10.0f / %-10.0f  │  "
-                      "%6.2fx / %.2fx",
-                      num_ops, pw, pr, sw, sr, pw > 0 ? sw / pw : 0,
-                      pr > 0 ? sr / pr : 0);
+                      "%10d  │  %10.0f / %-10.0f  │  %10.1f / %-10.1f  │  "
+                      "%10.1f / %-10.1f  │  %6.2fx / %.2fx",
+                      num_ops, pw, pr, pw_mb, pr_mb, sw_mb, sr_mb,
+                      pw_mb > 0 ? sw_mb / pw_mb : 0,
+                      pr_mb > 0 ? sr_mb / pr_mb : 0);
         std::cout << row << "\n";
     }
 
