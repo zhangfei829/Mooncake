@@ -576,7 +576,7 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
     double offload_bytes = static_cast<double>(total_written) * value_size;
     result.offload_bw_mbps = (offload_bytes / (1024.0 * 1024.0)) / offload_secs;
 
-    // --- Load (read) ---
+    // --- Load (read) — batch ALL keys per thread to exploit SPDK multi-core ---
     std::vector<LatencyStats> r_latencies(threads);
 
     auto load_total_t0 = Clock::now();
@@ -588,26 +588,32 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
                 size_t end =
                     (t == threads - 1) ? num_keys : start + keys_per_thread;
 
-                for (size_t i = start; i < end; ++i) {
-                    auto rbuf = std::make_unique<char[]>(value_size);
-                    std::unordered_map<std::string, Slice> slices;
-                    slices.emplace(keys[i],
-                                   Slice{rbuf.get(), value_size});
+                size_t count = end - start;
+                auto rbufs = std::make_unique<std::unique_ptr<char[]>[]>(count);
+                std::unordered_map<std::string, Slice> slices;
+                slices.reserve(count);
+                for (size_t i = 0; i < count; ++i) {
+                    rbufs[i] = std::make_unique<char[]>(value_size);
+                    slices.emplace(keys[start + i],
+                                   Slice{rbufs[i].get(), value_size});
+                }
 
-                    auto t0 = Clock::now();
-                    auto res = be.BatchLoad(slices);
-                    auto t1 = Clock::now();
+                auto t0 = Clock::now();
+                auto res = be.BatchLoad(slices);
+                auto t1 = Clock::now();
 
-                    double us =
-                        std::chrono::duration<double, std::micro>(t1 - t0)
-                            .count();
-                    r_latencies[t].Add(us);
+                double us =
+                    std::chrono::duration<double, std::micro>(t1 - t0).count();
+                r_latencies[t].Add(us);
 
-                    if (do_verify && res.has_value()) {
-                        if (std::memcmp(rbuf.get(), values[i].data(),
+                if (do_verify && res.has_value()) {
+                    for (size_t i = 0; i < count; ++i) {
+                        if (std::memcmp(rbufs[i].get(),
+                                        values[start + i].data(),
                                         value_size) != 0) {
                             LOG(ERROR)
-                                << "Backend verify FAILED for " << keys[i];
+                                << "Backend verify FAILED for "
+                                << keys[start + i];
                         }
                     }
                 }

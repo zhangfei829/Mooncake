@@ -299,6 +299,9 @@ class SpdkFile : public StorageFile {
     void *AcquireDmaBuf(size_t needed);
     void ReleaseDmaBuf(void *buf, size_t size);
 
+    void *DmaPoolAlloc(size_t needed);
+    void DmaPoolFree(void *buf, size_t size);
+
     uint64_t base_offset_;
     uint64_t current_offset_;
     uint64_t max_size_;
@@ -306,6 +309,9 @@ class SpdkFile : public StorageFile {
 
     void *cached_dma_buf_{nullptr};
     size_t cached_dma_size_{0};
+
+    struct DmaPoolEntry { void *buf; size_t size; };
+    std::vector<DmaPoolEntry> dma_pool_;
 };
 #endif  // USE_SPDK
 

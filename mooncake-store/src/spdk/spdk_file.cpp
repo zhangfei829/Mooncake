@@ -28,6 +28,9 @@ SpdkFile::~SpdkFile() {
         cached_dma_buf_ = nullptr;
         cached_dma_size_ = 0;
     }
+    auto &env = SpdkEnv::Instance();
+    for (auto &e : dma_pool_) env.DmaFree(e.buf);
+    dma_pool_.clear();
     fd_ = -1;
 }
 
@@ -49,6 +52,30 @@ void *SpdkFile::AcquireDmaBuf(size_t needed) {
 
 void ReleaseDmaBuf(void *, size_t) {
     // No-op: buffer stays cached for reuse, freed in destructor
+}
+
+// Pool for batch reads — avoids spdk_dma_malloc/free in hot path.
+// Returns the best-fit buffer from pool; falls back to DmaMalloc.
+void *SpdkFile::DmaPoolAlloc(size_t needed) {
+    int best = -1;
+    size_t best_size = SIZE_MAX;
+    for (int i = 0; i < static_cast<int>(dma_pool_.size()); ++i) {
+        if (dma_pool_[i].size >= needed && dma_pool_[i].size < best_size) {
+            best = i;
+            best_size = dma_pool_[i].size;
+        }
+    }
+    if (best >= 0) {
+        void *buf = dma_pool_[best].buf;
+        dma_pool_[best] = dma_pool_.back();
+        dma_pool_.pop_back();
+        return buf;
+    }
+    return SpdkEnv::Instance().DmaMalloc(needed, block_size_);
+}
+
+void SpdkFile::DmaPoolFree(void *buf, size_t size) {
+    dma_pool_.push_back({buf, size});
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +264,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
 
     struct ReadCtx {
         void *dma_buf;
+        size_t alloc_len;
         size_t skip;
     };
 
@@ -256,13 +284,13 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         size_t skip = abs_off - aligned_off;
         size_t aligned_len = align_up(total + skip);
 
-        void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+        void *dma_buf = DmaPoolAlloc(aligned_len);
         if (!dma_buf) {
-            for (int j = 0; j < i; ++j) env.DmaFree(ctxs[j].dma_buf);
+            for (int j = 0; j < i; ++j) DmaPoolFree(ctxs[j].dma_buf, ctxs[j].alloc_len);
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
 
-        ctxs[i] = {dma_buf, skip};
+        ctxs[i] = {dma_buf, aligned_len, skip};
         reqs[i].op = SpdkIoRequest::READ;
         reqs[i].buf = dma_buf;
         reqs[i].offset = aligned_off;
@@ -288,7 +316,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         }
     }
 
-    for (int i = 0; i < count; ++i) env.DmaFree(ctxs[i].dma_buf);
+    for (int i = 0; i < count; ++i) DmaPoolFree(ctxs[i].dma_buf, ctxs[i].alloc_len);
 
     for (int i = 0; i < count; ++i) {
         if (!reqs[i].success)
