@@ -20,3 +20,12 @@ target_link_libraries(storage_backend_bench PRIVATE
     glog::glog
     pthread
 )
+
+# SPDK vs PosixFile performance benchmark
+add_executable(spdk_bench spdk_bench.cpp)
+target_link_libraries(spdk_bench PRIVATE
+    mooncake_store
+    gflags::gflags
+    glog::glog
+    pthread
+)
