@@ -140,17 +140,21 @@ static BandwidthResult BenchFileSeq(StorageFile &file, size_t chunk_size,
     size_t remaining = total_bytes;
     off_t offset = 0;
 
+    // Pre-allocate buffers once outside the hot loop
+    std::vector<char> buf(chunk_size);
+    std::vector<char> verify_buf;
+    if (do_verify) verify_buf.resize(chunk_size);
+
     auto wall_t0 = Clock::now();
 
     while (remaining > 0) {
         size_t this_chunk = std::min(chunk_size, remaining);
 
         if (is_write) {
-            std::string wbuf(this_chunk, '\0');
-            FillPattern(wbuf.data(), this_chunk, static_cast<uint32_t>(offset));
+            FillPattern(buf.data(), this_chunk, static_cast<uint32_t>(offset));
 
             auto t0 = Clock::now();
-            iovec iov{const_cast<char *>(wbuf.data()), this_chunk};
+            iovec iov{buf.data(), this_chunk};
             auto res = file.vector_write(&iov, 1, offset);
             auto t1 = Clock::now();
 
@@ -162,8 +166,7 @@ static BandwidthResult BenchFileSeq(StorageFile &file, size_t chunk_size,
             result.latency.Add(us);
             result.total_bytes += this_chunk;
         } else {
-            std::string rbuf(this_chunk, '\0');
-            iovec iov{rbuf.data(), this_chunk};
+            iovec iov{buf.data(), this_chunk};
 
             auto t0 = Clock::now();
             auto res = file.vector_read(&iov, 1, offset);
@@ -178,10 +181,9 @@ static BandwidthResult BenchFileSeq(StorageFile &file, size_t chunk_size,
             result.total_bytes += this_chunk;
 
             if (do_verify) {
-                std::vector<char> expected(this_chunk);
-                FillPattern(expected.data(), this_chunk,
+                FillPattern(verify_buf.data(), this_chunk,
                             static_cast<uint32_t>(offset));
-                if (std::memcmp(rbuf.data(), expected.data(), this_chunk) != 0) {
+                if (std::memcmp(buf.data(), verify_buf.data(), this_chunk) != 0) {
                     LOG(ERROR) << "Verify FAILED at offset " << offset;
                 }
             }
@@ -211,15 +213,16 @@ static BandwidthResult BenchFileRand(StorageFile &file, size_t io_size,
     std::mt19937 gen(12345);
     std::uniform_int_distribution<size_t> dist(0, max_offset / block_align);
 
+    std::vector<char> buf(io_size);
+
     auto wall_t0 = Clock::now();
 
     for (int i = 0; i < num_ops; ++i) {
         off_t offset = static_cast<off_t>(dist(gen) * block_align);
 
         if (is_write) {
-            std::string wbuf(io_size, '\0');
-            FillPattern(wbuf.data(), io_size, static_cast<uint32_t>(offset ^ i));
-            iovec iov{const_cast<char *>(wbuf.data()), io_size};
+            FillPattern(buf.data(), io_size, static_cast<uint32_t>(offset ^ i));
+            iovec iov{buf.data(), io_size};
 
             auto t0 = Clock::now();
             auto res = file.vector_write(&iov, 1, offset);
@@ -230,8 +233,7 @@ static BandwidthResult BenchFileRand(StorageFile &file, size_t io_size,
             result.latency.Add(us);
             result.total_bytes += io_size;
         } else {
-            std::string rbuf(io_size, '\0');
-            iovec iov{rbuf.data(), io_size};
+            iovec iov{buf.data(), io_size};
 
             auto t0 = Clock::now();
             auto res = file.vector_read(&iov, 1, offset);

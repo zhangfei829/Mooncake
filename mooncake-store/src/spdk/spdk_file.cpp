@@ -22,7 +22,34 @@ SpdkFile::SpdkFile(const std::string &filename, uint64_t base_offset,
     }
 }
 
-SpdkFile::~SpdkFile() { fd_ = -1; }
+SpdkFile::~SpdkFile() {
+    if (cached_dma_buf_) {
+        SpdkEnv::Instance().DmaFree(cached_dma_buf_);
+        cached_dma_buf_ = nullptr;
+        cached_dma_size_ = 0;
+    }
+    fd_ = -1;
+}
+
+// ---------------------------------------------------------------------------
+// DMA buffer cache — avoids spdk_dma_malloc/free per I/O
+// ---------------------------------------------------------------------------
+void *SpdkFile::AcquireDmaBuf(size_t needed) {
+    if (cached_dma_buf_ && cached_dma_size_ >= needed) {
+        return cached_dma_buf_;
+    }
+    if (cached_dma_buf_) {
+        SpdkEnv::Instance().DmaFree(cached_dma_buf_);
+    }
+    size_t alloc_size = std::max(needed, static_cast<size_t>(64 * 1024));
+    cached_dma_buf_ = SpdkEnv::Instance().DmaMalloc(alloc_size, block_size_);
+    cached_dma_size_ = cached_dma_buf_ ? alloc_size : 0;
+    return cached_dma_buf_;
+}
+
+void ReleaseDmaBuf(void *, size_t) {
+    // No-op: buffer stays cached for reuse, freed in destructor
+}
 
 // ---------------------------------------------------------------------------
 // Sequential write
@@ -44,9 +71,8 @@ tl::expected<size_t, ErrorCode> SpdkFile::write(std::span<const char> data,
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    auto &env = SpdkEnv::Instance();
     size_t aligned_len = align_up(length);
-    void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+    void *dma_buf = AcquireDmaBuf(aligned_len);
     if (!dma_buf) {
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -62,9 +88,8 @@ tl::expected<size_t, ErrorCode> SpdkFile::write(std::span<const char> data,
     req.buf = dma_buf;
     req.offset = base_offset_ + current_offset_;
     req.nbytes = aligned_len;
-    env.SubmitIo(&req);
+    SpdkEnv::Instance().SubmitIo(&req);
 
-    env.DmaFree(dma_buf);
     if (!req.success) {
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -85,9 +110,8 @@ tl::expected<size_t, ErrorCode> SpdkFile::read(std::string &buffer,
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    auto &env = SpdkEnv::Instance();
     size_t aligned_len = align_up(length);
-    void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+    void *dma_buf = AcquireDmaBuf(aligned_len);
     if (!dma_buf) {
         return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
     }
@@ -97,15 +121,13 @@ tl::expected<size_t, ErrorCode> SpdkFile::read(std::string &buffer,
     req.buf = dma_buf;
     req.offset = base_offset_ + current_offset_;
     req.nbytes = aligned_len;
-    env.SubmitIo(&req);
+    SpdkEnv::Instance().SubmitIo(&req);
 
     if (!req.success) {
-        env.DmaFree(dma_buf);
         return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
     }
 
     buffer.assign(static_cast<const char *>(dma_buf), length);
-    env.DmaFree(dma_buf);
 
     current_offset_ += length;
     return length;
@@ -127,9 +149,8 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_write(const iovec *iov,
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    auto &env = SpdkEnv::Instance();
     size_t aligned_len = align_up(total);
-    void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+    void *dma_buf = AcquireDmaBuf(aligned_len);
     if (!dma_buf) {
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -157,9 +178,8 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_write(const iovec *iov,
     req.buf = dma_buf;
     req.offset = aligned_offset;
     req.nbytes = aligned_len;
-    env.SubmitIo(&req);
+    SpdkEnv::Instance().SubmitIo(&req);
 
-    env.DmaFree(dma_buf);
     if (!req.success) {
         return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -182,7 +202,6 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_read(const iovec *iov,
         return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    auto &env = SpdkEnv::Instance();
     uint64_t abs_offset =
         base_offset_ + static_cast<uint64_t>(offset);
     size_t aligned_offset =
@@ -190,7 +209,7 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_read(const iovec *iov,
     size_t skip = abs_offset - aligned_offset;
     size_t aligned_len = align_up(total + skip);
 
-    void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+    void *dma_buf = AcquireDmaBuf(aligned_len);
     if (!dma_buf) {
         return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
     }
@@ -200,10 +219,9 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_read(const iovec *iov,
     req.buf = dma_buf;
     req.offset = aligned_offset;
     req.nbytes = aligned_len;
-    env.SubmitIo(&req);
+    SpdkEnv::Instance().SubmitIo(&req);
 
     if (!req.success) {
-        env.DmaFree(dma_buf);
         return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
     }
 
@@ -213,7 +231,6 @@ tl::expected<size_t, ErrorCode> SpdkFile::vector_read(const iovec *iov,
         src += iov[i].iov_len;
     }
 
-    env.DmaFree(dma_buf);
     return total;
 }
 

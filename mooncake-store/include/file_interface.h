@@ -277,10 +277,16 @@ class SpdkFile : public StorageFile {
         return (v + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
     }
 
+    void *AcquireDmaBuf(size_t needed);
+    void ReleaseDmaBuf(void *buf, size_t size);
+
     uint64_t base_offset_;
     uint64_t current_offset_;
     uint64_t max_size_;
     uint32_t block_size_;
+
+    void *cached_dma_buf_{nullptr};
+    size_t cached_dma_size_{0};
 };
 #endif  // USE_SPDK
 
