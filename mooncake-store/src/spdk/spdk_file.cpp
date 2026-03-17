@@ -236,8 +236,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
     auto &env = SpdkEnv::Instance();
 
     struct ReadCtx {
-        size_t buf_offset;
-        size_t aligned_len;
+        void *dma_buf;
         size_t skip;
     };
 
@@ -245,7 +244,6 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
     auto reqs = std::make_unique<SpdkIoRequest[]>(count);
     auto ptrs = std::make_unique<SpdkIoRequest *[]>(count);
 
-    size_t total_dma = 0;
     for (int i = 0; i < count; ++i) {
         size_t total = 0;
         for (int j = 0; j < entries[i].iovcnt; ++j)
@@ -258,30 +256,23 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         size_t skip = abs_off - aligned_off;
         size_t aligned_len = align_up(total + skip);
 
-        ctxs[i] = {total_dma, aligned_len, skip};
-        total_dma += aligned_len;
-    }
+        void *dma_buf = env.DmaMalloc(aligned_len, block_size_);
+        if (!dma_buf) {
+            for (int j = 0; j < i; ++j) env.DmaFree(ctxs[j].dma_buf);
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
 
-    void *big_buf = env.DmaMalloc(total_dma, block_size_);
-    if (!big_buf)
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-
-    for (int i = 0; i < count; ++i) {
-        uint64_t abs_off =
-            base_offset_ + static_cast<uint64_t>(entries[i].offset);
-        size_t aligned_off =
-            abs_off & ~(static_cast<size_t>(block_size_) - 1);
-
+        ctxs[i] = {dma_buf, skip};
         reqs[i].op = SpdkIoRequest::READ;
-        reqs[i].buf = static_cast<char *>(big_buf) + ctxs[i].buf_offset;
+        reqs[i].buf = dma_buf;
         reqs[i].offset = aligned_off;
-        reqs[i].nbytes = ctxs[i].aligned_len;
+        reqs[i].nbytes = aligned_len;
         reqs[i].src_data = nullptr;
         reqs[i].src_iov = nullptr;
         reqs[i].src_iovcnt = 0;
         reqs[i].dst_iov = entries[i].iov;
         reqs[i].dst_iovcnt = entries[i].iovcnt;
-        reqs[i].dst_skip = ctxs[i].skip;
+        reqs[i].dst_skip = skip;
         ptrs[i] = &reqs[i];
     }
 
@@ -297,7 +288,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         }
     }
 
-    env.DmaFree(big_buf);
+    for (int i = 0; i < count; ++i) env.DmaFree(ctxs[i].dma_buf);
 
     for (int i = 0; i < count; ++i) {
         if (!reqs[i].success)
