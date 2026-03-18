@@ -79,8 +79,8 @@ DEFINE_int32(mem_size_mb, 0,
              "Limit DPDK hugepage memory in MB (0 = use all available). "
              "Useful on machines with limited RAM.");
 DEFINE_int32(pipeline_chunk_kb, 0,
-             "Chunked DMA+memcpy pipeline chunk size in KB (0=default 2048). "
-             "Try 512, 1024, 2048, 4096 to find optimal for your hardware.");
+             "Chunked DMA+memcpy pipeline chunk size in KB (0=default 4096). "
+             "Use --test=pipeline_tune to find optimal for your hardware.");
 DEFINE_int32(pipeline_threshold_kb, 0,
              "Min aligned entry size (KB) to enable pipeline (0=default 4096).");
 

@@ -12,8 +12,10 @@ extern "C" {
 namespace mooncake {
 
 // Defaults; overridable via SpdkEnvConfig / --pipeline_chunk_kb at runtime.
-static size_t g_pipeline_threshold = 4ULL * 1024 * 1024;
-static size_t g_pipeline_chunk = 2ULL * 1024 * 1024;
+// 4MB chunk empirically optimal on PCIe Gen4 NVMe (Micron 7450).
+// Threshold = 2×chunk ensures at least 2 chunks for meaningful overlap.
+static size_t g_pipeline_chunk = 4ULL * 1024 * 1024;
+static size_t g_pipeline_threshold = 2 * g_pipeline_chunk;
 
 void SpdkEnv::SetPipelineParams(size_t threshold, size_t chunk) {
     g_pipeline_threshold = threshold;

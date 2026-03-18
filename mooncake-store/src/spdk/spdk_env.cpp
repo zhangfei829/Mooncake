@@ -398,12 +398,12 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
 
     // Apply pipeline chunk/threshold from config
     {
-        size_t thresh = config_.pipeline_threshold_kb > 0
-            ? static_cast<size_t>(config_.pipeline_threshold_kb) * 1024
-            : 4ULL * 1024 * 1024;
         size_t chunk = config_.pipeline_chunk_kb > 0
             ? static_cast<size_t>(config_.pipeline_chunk_kb) * 1024
-            : 2ULL * 1024 * 1024;
+            : 4ULL * 1024 * 1024;
+        size_t thresh = config_.pipeline_threshold_kb > 0
+            ? static_cast<size_t>(config_.pipeline_threshold_kb) * 1024
+            : 2 * chunk;  // at least 2 chunks for meaningful overlap
         SpdkEnv::SetPipelineParams(thresh, chunk);
         LOG(INFO) << "SpdkEnv: pipeline chunk=" << chunk / 1024
                   << "KB threshold=" << thresh / 1024 << "KB";
