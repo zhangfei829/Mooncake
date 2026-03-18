@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 #include <glog/logging.h>
 
@@ -9,6 +10,18 @@ extern "C" {
 }
 
 namespace mooncake {
+
+// Defaults; overridable via SpdkEnvConfig / --pipeline_chunk_kb at runtime.
+static size_t g_pipeline_threshold = 4ULL * 1024 * 1024;
+static size_t g_pipeline_chunk = 2ULL * 1024 * 1024;
+
+void SpdkEnv::SetPipelineParams(size_t threshold, size_t chunk) {
+    g_pipeline_threshold = threshold;
+    g_pipeline_chunk = chunk;
+}
+
+size_t SpdkEnv::GetPipelineChunk() const { return g_pipeline_chunk; }
+size_t SpdkEnv::GetPipelineThreshold() const { return g_pipeline_threshold; }
 
 SpdkFile::SpdkFile(const std::string &filename, uint64_t base_offset,
                    uint64_t max_size)
@@ -238,97 +251,128 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
 
     auto &env = SpdkEnv::Instance();
 
-    size_t max_aligned = 0;
+    // Partition entries: large ones use chunked pipeline, small ones use batch
+    std::vector<int> small_idx, large_idx;
+    small_idx.reserve(count);
+    large_idx.reserve(count);
+
     for (int i = 0; i < count; ++i) {
         size_t total = 0;
         for (int j = 0; j < entries[i].iovcnt; ++j)
             total += entries[i].iov[j].iov_len;
         size_t al = align_up(total);
-        if (al > max_aligned) max_aligned = al;
+        if (al >= g_pipeline_threshold)
+            large_idx.push_back(i);
+        else
+            small_idx.push_back(i);
     }
 
-    constexpr size_t kDmaBudgetBytes = 256ULL * 1024 * 1024;
-    int max_qd_by_mem = max_aligned > 0
-        ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
-        : 128;
-    int qd = std::min({count, 128, max_qd_by_mem});
-
-    auto dma_bufs = std::make_unique<void *[]>(qd);
-    int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
-                                    block_size_);
-    if (got == 0) {
-        for (int try_qd = std::max(1, qd / 2); try_qd >= 1 && got == 0;
-             try_qd = try_qd > 1 ? try_qd / 2 : 0) {
-            got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned,
-                                        try_qd, block_size_);
-        }
-        if (got == 0) {
-            LOG(ERROR) << "SpdkFile: write_batch DMA alloc got 0 buffers"
-                       << " after retries (requested=" << qd
-                       << " × " << max_aligned << ")";
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-        LOG(WARNING) << "SpdkFile: write_batch DMA alloc retried, got "
-                     << got << "/" << qd << " × " << max_aligned;
-    } else if (got < qd) {
-        LOG(WARNING) << "SpdkFile: write_batch DMA alloc partial "
-                     << got << "/" << qd << " × " << max_aligned;
-    }
-    qd = got;
-
-    auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
-    auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
-
-    int submitted = 0, completed = 0;
-    int head = 0, tail = 0;
     ErrorCode first_err = ErrorCode::OK;
 
-    while (completed < count) {
-        int batch_count = 0;
-        while (submitted - completed < qd && submitted < count) {
-            int slot = head;
-            int idx = submitted;
+    // --- Process large entries via chunked double-buffer pipeline ---
+    for (int i : large_idx) {
+        size_t total = 0;
+        for (int j = 0; j < entries[i].iovcnt; ++j)
+            total += entries[i].iov[j].iov_len;
+        uint64_t abs_off =
+            base_offset_ + static_cast<uint64_t>(entries[i].offset);
+        size_t aligned_off =
+            abs_off & ~(static_cast<size_t>(block_size_) - 1);
+        size_t al = align_up(total);
 
-            size_t total = 0;
-            for (int j = 0; j < entries[idx].iovcnt; ++j)
-                total += entries[idx].iov[j].iov_len;
-
-            uint64_t abs_off =
-                base_offset_ + static_cast<uint64_t>(entries[idx].offset);
-            size_t aligned_off =
-                abs_off & ~(static_cast<size_t>(block_size_) - 1);
-            size_t al = align_up(total);
-
-            reqs[slot].op = SpdkIoRequest::WRITE;
-            reqs[slot].buf = dma_bufs[slot];
-            reqs[slot].offset = aligned_off;
-            reqs[slot].nbytes = al;
-            reqs[slot].src_iov = entries[idx].iov;
-            reqs[slot].src_iovcnt = entries[idx].iovcnt;
-            reqs[slot].src_data = nullptr;
-            reqs[slot].src_len = 0;
-            reqs[slot].dst_iov = nullptr;
-            reqs[slot].dst_iovcnt = 0;
-
-            batch_ptrs[batch_count++] = &reqs[slot];
-            submitted++;
-            head = (head + 1) % qd;
-        }
-
-        if (batch_count > 0)
-            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
-
-        while (completed < submitted) {
-            if (!reqs[tail].completed.load(std::memory_order_acquire))
-                break;
-            if (!reqs[tail].success && first_err == ErrorCode::OK)
-                first_err = ErrorCode::FILE_WRITE_FAIL;
-            completed++;
-            tail = (tail + 1) % qd;
-        }
+        auto ec = ChunkedWriteOne(env, aligned_off, al,
+                                  entries[i].iov, entries[i].iovcnt,
+                                  total, block_size_);
+        if (ec != ErrorCode::OK && first_err == ErrorCode::OK)
+            first_err = ec;
     }
 
-    env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
+    // --- Process small entries via existing batch pipeline ---
+    int small_count = static_cast<int>(small_idx.size());
+    if (small_count > 0 && first_err == ErrorCode::OK) {
+        size_t max_aligned = 0;
+        for (int i : small_idx) {
+            size_t total = 0;
+            for (int j = 0; j < entries[i].iovcnt; ++j)
+                total += entries[i].iov[j].iov_len;
+            size_t al = align_up(total);
+            if (al > max_aligned) max_aligned = al;
+        }
+
+        constexpr size_t kDmaBudgetBytes = 256ULL * 1024 * 1024;
+        int max_qd_by_mem = max_aligned > 0
+            ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
+            : 128;
+        int qd = std::min({small_count, 128, max_qd_by_mem});
+
+        auto dma_bufs = std::make_unique<void *[]>(qd);
+        int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
+                                        block_size_);
+        if (got == 0) {
+            for (int try_qd = std::max(1, qd / 2); try_qd >= 1 && got == 0;
+                 try_qd = try_qd > 1 ? try_qd / 2 : 0)
+                got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned,
+                                            try_qd, block_size_);
+            if (got == 0) {
+                LOG(ERROR) << "SpdkFile: write_batch DMA alloc 0 buffers";
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+        qd = got;
+
+        auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
+        auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
+
+        int submitted = 0, completed = 0;
+        int head = 0, tail = 0;
+
+        while (completed < small_count) {
+            int batch_count = 0;
+            while (submitted - completed < qd && submitted < small_count) {
+                int slot = head;
+                int idx = small_idx[submitted];
+
+                size_t total = 0;
+                for (int j = 0; j < entries[idx].iovcnt; ++j)
+                    total += entries[idx].iov[j].iov_len;
+                uint64_t abs_off =
+                    base_offset_ +
+                    static_cast<uint64_t>(entries[idx].offset);
+                size_t aligned_off =
+                    abs_off & ~(static_cast<size_t>(block_size_) - 1);
+                size_t al = align_up(total);
+
+                reqs[slot].op = SpdkIoRequest::WRITE;
+                reqs[slot].buf = dma_bufs[slot];
+                reqs[slot].offset = aligned_off;
+                reqs[slot].nbytes = al;
+                reqs[slot].src_iov = entries[idx].iov;
+                reqs[slot].src_iovcnt = entries[idx].iovcnt;
+                reqs[slot].src_data = nullptr;
+                reqs[slot].src_len = 0;
+                reqs[slot].dst_iov = nullptr;
+                reqs[slot].dst_iovcnt = 0;
+
+                batch_ptrs[batch_count++] = &reqs[slot];
+                submitted++;
+                head = (head + 1) % qd;
+            }
+
+            if (batch_count > 0)
+                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+
+            while (completed < submitted) {
+                if (!reqs[tail].completed.load(std::memory_order_acquire))
+                    break;
+                if (!reqs[tail].success && first_err == ErrorCode::OK)
+                    first_err = ErrorCode::FILE_WRITE_FAIL;
+                completed++;
+                tail = (tail + 1) % qd;
+            }
+        }
+
+        env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
+    }
 
     if (first_err != ErrorCode::OK)
         return tl::make_unexpected(first_err);
@@ -336,8 +380,258 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
 }
 
 // ---------------------------------------------------------------------------
+// Chunked read pipeline for a single large entry.
+// Uses double-buffering: overlap DMA read of chunk[N+1] with memcpy of chunk[N].
+// ---------------------------------------------------------------------------
+static ErrorCode ChunkedReadOne(SpdkEnv &env, uint64_t disk_offset,
+                                size_t aligned_len, size_t skip,
+                                const iovec *iov, int iovcnt,
+                                size_t total_user, uint32_t block_size) {
+    size_t chunk_aligned =
+        (g_pipeline_chunk + block_size - 1) & ~(size_t(block_size) - 1);
+
+    void *buf[2];
+    buf[0] = env.DmaPoolAlloc(chunk_aligned, block_size);
+    buf[1] = env.DmaPoolAlloc(chunk_aligned, block_size);
+    if (!buf[0] || !buf[1]) {
+        if (buf[0]) env.DmaPoolFree(buf[0], chunk_aligned);
+        if (buf[1]) env.DmaPoolFree(buf[1], chunk_aligned);
+        return ErrorCode::FILE_READ_FAIL;
+    }
+
+    size_t num_chunks = (aligned_len + chunk_aligned - 1) / chunk_aligned;
+    size_t disk_remaining = aligned_len;
+
+    // Flatten iov into a linear destination cursor
+    int cur_iov = 0;
+    size_t cur_iov_off = 0;
+    size_t user_copied = 0;
+    size_t skip_remaining = skip;
+
+    auto copy_from_dma = [&](const char *src, size_t dma_bytes) {
+        // Skip alignment prefix bytes
+        if (skip_remaining > 0) {
+            size_t s = std::min(skip_remaining, dma_bytes);
+            src += s;
+            dma_bytes -= s;
+            skip_remaining -= s;
+        }
+        // Copy to iov entries
+        while (dma_bytes > 0 && cur_iov < iovcnt &&
+               user_copied < total_user) {
+            size_t avail =
+                iov[cur_iov].iov_len - cur_iov_off;
+            size_t to_copy = std::min({dma_bytes, avail,
+                                       total_user - user_copied});
+            std::memcpy(static_cast<char *>(iov[cur_iov].iov_base) +
+                            cur_iov_off,
+                        src, to_copy);
+            src += to_copy;
+            dma_bytes -= to_copy;
+            user_copied += to_copy;
+            cur_iov_off += to_copy;
+            if (cur_iov_off >= iov[cur_iov].iov_len) {
+                cur_iov++;
+                cur_iov_off = 0;
+            }
+        }
+    };
+
+    ErrorCode err = ErrorCode::OK;
+
+    // Submit first chunk
+    SpdkIoRequest req0;
+    size_t c0_bytes = std::min(chunk_aligned, disk_remaining);
+    req0.op = SpdkIoRequest::READ;
+    req0.buf = buf[0];
+    req0.offset = disk_offset;
+    req0.nbytes = c0_bytes;
+    req0.src_data = nullptr; req0.src_iov = nullptr; req0.src_iovcnt = 0;
+    req0.dst_iov = nullptr; req0.dst_iovcnt = 0;
+    req0.completed.store(false, std::memory_order_relaxed);
+    req0.success = false;
+    env.SubmitIoAsync(&req0);
+
+    // Wait for first chunk
+    while (!req0.completed.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+    if (!req0.success) { err = ErrorCode::FILE_READ_FAIL; goto cleanup; }
+
+    disk_remaining -= c0_bytes;
+
+    // Pipeline loop: for chunk i (>= 1), submit DMA for chunk[i] then memcpy chunk[i-1]
+    for (size_t ci = 1; ci < num_chunks; ++ci) {
+        int cur_buf = ci & 1;
+        int prev_buf = 1 - cur_buf;
+
+        size_t ci_bytes = std::min(chunk_aligned, disk_remaining);
+        SpdkIoRequest req_next;
+        req_next.op = SpdkIoRequest::READ;
+        req_next.buf = buf[cur_buf];
+        req_next.offset = disk_offset + ci * chunk_aligned;
+        req_next.nbytes = ci_bytes;
+        req_next.src_data = nullptr; req_next.src_iov = nullptr;
+        req_next.src_iovcnt = 0;
+        req_next.dst_iov = nullptr; req_next.dst_iovcnt = 0;
+        req_next.completed.store(false, std::memory_order_relaxed);
+        req_next.success = false;
+        env.SubmitIoAsync(&req_next);
+
+        // Memcpy previous chunk while NVMe reads current chunk
+        size_t prev_bytes = (ci == 1) ? c0_bytes : chunk_aligned;
+        copy_from_dma(static_cast<const char *>(buf[prev_buf]), prev_bytes);
+
+        // Wait for current chunk DMA
+        while (!req_next.completed.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#else
+            std::this_thread::yield();
+#endif
+        }
+        if (!req_next.success) { err = ErrorCode::FILE_READ_FAIL; goto cleanup; }
+        disk_remaining -= ci_bytes;
+    }
+
+    // Memcpy the last chunk
+    {
+        int last_buf = (num_chunks > 1) ? ((num_chunks - 1) & 1) : 0;
+        size_t last_bytes = (num_chunks == 1) ? c0_bytes
+            : std::min(chunk_aligned, aligned_len - (num_chunks - 1) * chunk_aligned);
+        copy_from_dma(static_cast<const char *>(buf[last_buf]), last_bytes);
+    }
+
+cleanup:
+    env.DmaPoolFree(buf[0], chunk_aligned);
+    env.DmaPoolFree(buf[1], chunk_aligned);
+    return err;
+}
+
+// ---------------------------------------------------------------------------
+// Chunked write pipeline for a single large entry.
+// Uses double-buffering: overlap memcpy of chunk[N+1] with DMA write of chunk[N].
+// ---------------------------------------------------------------------------
+static ErrorCode ChunkedWriteOne(SpdkEnv &env, uint64_t disk_offset,
+                                 size_t aligned_len,
+                                 const iovec *iov, int iovcnt,
+                                 size_t total_user, uint32_t block_size) {
+    size_t chunk_aligned =
+        (g_pipeline_chunk + block_size - 1) & ~(size_t(block_size) - 1);
+
+    void *buf[2];
+    buf[0] = env.DmaPoolAlloc(chunk_aligned, block_size);
+    buf[1] = env.DmaPoolAlloc(chunk_aligned, block_size);
+    if (!buf[0] || !buf[1]) {
+        if (buf[0]) env.DmaPoolFree(buf[0], chunk_aligned);
+        if (buf[1]) env.DmaPoolFree(buf[1], chunk_aligned);
+        return ErrorCode::FILE_WRITE_FAIL;
+    }
+
+    size_t num_chunks = (aligned_len + chunk_aligned - 1) / chunk_aligned;
+    size_t disk_remaining = aligned_len;
+
+    int cur_iov = 0;
+    size_t cur_iov_off = 0;
+    size_t user_copied = 0;
+
+    auto copy_to_dma = [&](char *dst, size_t dma_bytes) {
+        size_t filled = 0;
+        while (filled < dma_bytes && cur_iov < iovcnt &&
+               user_copied < total_user) {
+            size_t avail = iov[cur_iov].iov_len - cur_iov_off;
+            size_t to_copy = std::min({dma_bytes - filled, avail,
+                                       total_user - user_copied});
+            std::memcpy(dst + filled,
+                        static_cast<const char *>(iov[cur_iov].iov_base) +
+                            cur_iov_off,
+                        to_copy);
+            filled += to_copy;
+            user_copied += to_copy;
+            cur_iov_off += to_copy;
+            if (cur_iov_off >= iov[cur_iov].iov_len) {
+                cur_iov++;
+                cur_iov_off = 0;
+            }
+        }
+        if (filled < dma_bytes)
+            std::memset(dst + filled, 0, dma_bytes - filled);
+    };
+
+    ErrorCode err = ErrorCode::OK;
+
+    // Memcpy first chunk to buf[0]
+    size_t c0_bytes = std::min(chunk_aligned, disk_remaining);
+    copy_to_dma(static_cast<char *>(buf[0]), c0_bytes);
+
+    // Submit first chunk DMA write
+    SpdkIoRequest req_prev;
+    req_prev.op = SpdkIoRequest::WRITE;
+    req_prev.buf = buf[0];
+    req_prev.offset = disk_offset;
+    req_prev.nbytes = c0_bytes;
+    req_prev.src_data = nullptr; req_prev.src_iov = nullptr;
+    req_prev.src_iovcnt = 0;
+    req_prev.dst_iov = nullptr; req_prev.dst_iovcnt = 0;
+    req_prev.completed.store(false, std::memory_order_relaxed);
+    req_prev.success = false;
+    env.SubmitIoAsync(&req_prev);
+    disk_remaining -= c0_bytes;
+
+    // Pipeline loop: memcpy chunk[i] while DMA writes chunk[i-1]
+    for (size_t ci = 1; ci < num_chunks; ++ci) {
+        int cur_buf = ci & 1;
+
+        size_t ci_bytes = std::min(chunk_aligned, disk_remaining);
+        copy_to_dma(static_cast<char *>(buf[cur_buf]), ci_bytes);
+
+        // Wait for previous DMA write
+        while (!req_prev.completed.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+            __builtin_ia32_pause();
+#else
+            std::this_thread::yield();
+#endif
+        }
+        if (!req_prev.success) { err = ErrorCode::FILE_WRITE_FAIL; goto cleanup; }
+
+        // Submit current chunk DMA write
+        req_prev.op = SpdkIoRequest::WRITE;
+        req_prev.buf = buf[cur_buf];
+        req_prev.offset = disk_offset + ci * chunk_aligned;
+        req_prev.nbytes = ci_bytes;
+        req_prev.src_data = nullptr; req_prev.src_iov = nullptr;
+        req_prev.src_iovcnt = 0;
+        req_prev.dst_iov = nullptr; req_prev.dst_iovcnt = 0;
+        req_prev.completed.store(false, std::memory_order_relaxed);
+        req_prev.success = false;
+        env.SubmitIoAsync(&req_prev);
+        disk_remaining -= ci_bytes;
+    }
+
+    // Wait for last DMA write
+    while (!req_prev.completed.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+    if (!req_prev.success) err = ErrorCode::FILE_WRITE_FAIL;
+
+cleanup:
+    env.DmaPoolFree(buf[0], chunk_aligned);
+    env.DmaPoolFree(buf[1], chunk_aligned);
+    return err;
+}
+
+// ---------------------------------------------------------------------------
 // Batch pipelined read — continuous pipeline with fixed DMA window.
-// Mirrors the file-level benchmark's submit/drain loop so reactors never idle.
+// Large entries use chunked double-buffer pipeline for DMA+memcpy overlap.
 // ---------------------------------------------------------------------------
 tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
     const BatchReadEntry *entries, int count) {
@@ -348,7 +642,11 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
 
     auto &env = SpdkEnv::Instance();
 
-    size_t max_aligned = 0;
+    // Partition entries: large ones use chunked pipeline, small ones use batch
+    std::vector<int> small_idx, large_idx;
+    small_idx.reserve(count);
+    large_idx.reserve(count);
+
     for (int i = 0; i < count; ++i) {
         size_t total = 0;
         for (int j = 0; j < entries[i].iovcnt; ++j)
@@ -359,101 +657,128 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
             abs_off & ~(static_cast<size_t>(block_size_) - 1);
         size_t skip = abs_off - aligned_off;
         size_t al = align_up(total + skip);
-        if (al > max_aligned) max_aligned = al;
+        if (al >= g_pipeline_threshold)
+            large_idx.push_back(i);
+        else
+            small_idx.push_back(i);
     }
 
-    constexpr size_t kDmaBudgetBytes = 256ULL * 1024 * 1024;
-    int max_qd_by_mem = max_aligned > 0
-        ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
-        : 128;
-    int qd = std::min({count, 128, max_qd_by_mem});
-
-    auto dma_bufs = std::make_unique<void *[]>(qd);
-    int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
-                                    block_size_);
-    if (got == 0) {
-        for (int try_qd = std::max(1, qd / 2); try_qd >= 1 && got == 0;
-             try_qd = try_qd > 1 ? try_qd / 2 : 0) {
-            got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned,
-                                        try_qd, block_size_);
-        }
-        if (got == 0) {
-            LOG(ERROR) << "SpdkFile: read_batch DMA alloc got 0 buffers"
-                       << " after retries (requested=" << qd
-                       << " × " << max_aligned << ")";
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        LOG(WARNING) << "SpdkFile: read_batch DMA alloc retried, got "
-                     << got << "/" << qd << " × " << max_aligned;
-    } else if (got < qd) {
-        LOG(WARNING) << "SpdkFile: read_batch DMA alloc partial "
-                     << got << "/" << qd << " × " << max_aligned;
-    }
-    qd = got;
-
-    auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
-    auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
-
-    int submitted = 0, completed = 0;
-    int head = 0, tail = 0;
     ErrorCode first_err = ErrorCode::OK;
-    int fail_idx = -1;
 
-    while (completed < count) {
-        int batch_count = 0;
-        while (submitted - completed < qd && submitted < count) {
-            int slot = head;
-            int idx = submitted;
+    // --- Process large entries via chunked double-buffer pipeline ---
+    for (int i : large_idx) {
+        size_t total = 0;
+        for (int j = 0; j < entries[i].iovcnt; ++j)
+            total += entries[i].iov[j].iov_len;
+        uint64_t abs_off =
+            base_offset_ + static_cast<uint64_t>(entries[i].offset);
+        size_t aligned_off =
+            abs_off & ~(static_cast<size_t>(block_size_) - 1);
+        size_t skip = abs_off - aligned_off;
+        size_t al = align_up(total + skip);
 
+        auto ec = ChunkedReadOne(env, aligned_off, al, skip,
+                                 entries[i].iov, entries[i].iovcnt,
+                                 total, block_size_);
+        if (ec != ErrorCode::OK && first_err == ErrorCode::OK)
+            first_err = ec;
+    }
+
+    // --- Process small entries via existing batch pipeline ---
+    int small_count = static_cast<int>(small_idx.size());
+    if (small_count > 0 && first_err == ErrorCode::OK) {
+        size_t max_aligned = 0;
+        for (int i : small_idx) {
             size_t total = 0;
-            for (int j = 0; j < entries[idx].iovcnt; ++j)
-                total += entries[idx].iov[j].iov_len;
+            for (int j = 0; j < entries[i].iovcnt; ++j)
+                total += entries[i].iov[j].iov_len;
             uint64_t abs_off =
-                base_offset_ + static_cast<uint64_t>(entries[idx].offset);
+                base_offset_ + static_cast<uint64_t>(entries[i].offset);
             size_t aligned_off =
                 abs_off & ~(static_cast<size_t>(block_size_) - 1);
             size_t skip = abs_off - aligned_off;
             size_t al = align_up(total + skip);
-
-            reqs[slot].op = SpdkIoRequest::READ;
-            reqs[slot].buf = dma_bufs[slot];
-            reqs[slot].offset = aligned_off;
-            reqs[slot].nbytes = al;
-            reqs[slot].src_data = nullptr;
-            reqs[slot].src_iov = nullptr;
-            reqs[slot].src_iovcnt = 0;
-            reqs[slot].dst_iov = entries[idx].iov;
-            reqs[slot].dst_iovcnt = entries[idx].iovcnt;
-            reqs[slot].dst_skip = skip;
-
-            batch_ptrs[batch_count++] = &reqs[slot];
-            submitted++;
-            head = (head + 1) % qd;
+            if (al > max_aligned) max_aligned = al;
         }
 
-        if (batch_count > 0)
-            env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+        constexpr size_t kDmaBudgetBytes = 256ULL * 1024 * 1024;
+        int max_qd_by_mem = max_aligned > 0
+            ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
+            : 128;
+        int qd = std::min({small_count, 128, max_qd_by_mem});
 
-        while (completed < submitted) {
-            if (!reqs[tail].completed.load(std::memory_order_acquire))
-                break;
-            if (!reqs[tail].success && first_err == ErrorCode::OK) {
-                first_err = ErrorCode::FILE_READ_FAIL;
-                fail_idx = completed;
+        auto dma_bufs = std::make_unique<void *[]>(qd);
+        int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
+                                        block_size_);
+        if (got == 0) {
+            for (int try_qd = std::max(1, qd / 2); try_qd >= 1 && got == 0;
+                 try_qd = try_qd > 1 ? try_qd / 2 : 0)
+                got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned,
+                                            try_qd, block_size_);
+            if (got == 0) {
+                LOG(ERROR) << "SpdkFile: read_batch DMA alloc 0 buffers";
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
-            completed++;
-            tail = (tail + 1) % qd;
         }
+        qd = got;
+
+        auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
+        auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
+
+        int submitted = 0, completed = 0;
+        int head = 0, tail = 0;
+
+        while (completed < small_count) {
+            int batch_count = 0;
+            while (submitted - completed < qd && submitted < small_count) {
+                int slot = head;
+                int idx = small_idx[submitted];
+
+                size_t total = 0;
+                for (int j = 0; j < entries[idx].iovcnt; ++j)
+                    total += entries[idx].iov[j].iov_len;
+                uint64_t abs_off =
+                    base_offset_ +
+                    static_cast<uint64_t>(entries[idx].offset);
+                size_t aligned_off =
+                    abs_off & ~(static_cast<size_t>(block_size_) - 1);
+                size_t skip = abs_off - aligned_off;
+                size_t al = align_up(total + skip);
+
+                reqs[slot].op = SpdkIoRequest::READ;
+                reqs[slot].buf = dma_bufs[slot];
+                reqs[slot].offset = aligned_off;
+                reqs[slot].nbytes = al;
+                reqs[slot].src_data = nullptr;
+                reqs[slot].src_iov = nullptr;
+                reqs[slot].src_iovcnt = 0;
+                reqs[slot].dst_iov = entries[idx].iov;
+                reqs[slot].dst_iovcnt = entries[idx].iovcnt;
+                reqs[slot].dst_skip = skip;
+
+                batch_ptrs[batch_count++] = &reqs[slot];
+                submitted++;
+                head = (head + 1) % qd;
+            }
+
+            if (batch_count > 0)
+                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+
+            while (completed < submitted) {
+                if (!reqs[tail].completed.load(std::memory_order_acquire))
+                    break;
+                if (!reqs[tail].success && first_err == ErrorCode::OK)
+                    first_err = ErrorCode::FILE_READ_FAIL;
+                completed++;
+                tail = (tail + 1) % qd;
+            }
+        }
+
+        env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
     }
 
-    env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
-
-    if (first_err != ErrorCode::OK) {
-        LOG(ERROR) << "SpdkFile: read_batch I/O failed at entry " << fail_idx
-                   << "/" << count << " (qd=" << qd
-                   << ", buf=" << max_aligned << ")";
+    if (first_err != ErrorCode::OK)
         return tl::make_unexpected(first_err);
-    }
     return {};
 }
 

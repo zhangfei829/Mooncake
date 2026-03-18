@@ -78,6 +78,11 @@ DEFINE_string(posix_backend_dir, "",
 DEFINE_int32(mem_size_mb, 0,
              "Limit DPDK hugepage memory in MB (0 = use all available). "
              "Useful on machines with limited RAM.");
+DEFINE_int32(pipeline_chunk_kb, 0,
+             "Chunked DMA+memcpy pipeline chunk size in KB (0=default 2048). "
+             "Try 512, 1024, 2048, 4096 to find optimal for your hardware.");
+DEFINE_int32(pipeline_threshold_kb, 0,
+             "Min aligned entry size (KB) to enable pipeline (0=default 4096).");
 
 // ============================================================================
 // Helpers
@@ -173,6 +178,18 @@ struct BandwidthResult {
         return static_cast<double>(ops) / total_secs;
     }
 };
+
+static std::string FmtWR(double w, double r) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%9.1f / %-9.1f", w, r);
+    return buf;
+}
+
+static std::string FmtSpeedup(double sw, double sr) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%6.2fx / %6.2fx", sw, sr);
+    return buf;
+}
 
 static void FillPattern(char *buf, size_t len, uint32_t seed) {
     std::mt19937 gen(seed);
@@ -793,8 +810,10 @@ static void RunFileSeqBench() {
     const char *posix_mode = FLAGS_posix_direct ? "O_DIRECT" : "cached";
     bool on_real_disk = !FLAGS_nvme_pci_addr.empty();
 
+    const int TW = on_real_disk ? 128 : 95;
+
     std::cout << "\n";
-    PrintSeparator(on_real_disk ? 160 : 110);
+    PrintSeparator(TW);
     std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (SPDK=" << spdk_mode
               << ", Posix=" << posix_mode
               << ", cores=" << FLAGS_cores
@@ -823,25 +842,29 @@ static void RunFileSeqBench() {
         return sum / (v.size() - 2);
     };
 
+    char spdk_col[64];
+    std::snprintf(spdk_col, sizeof(spdk_col),
+                  "SPDK %dC QD=%d W/R MB/s", nc, FLAGS_iodepth);
+
     if (on_real_disk) {
-        PrintSeparator(180);
+        PrintSeparator(TW);
         char hdr[512];
         std::snprintf(hdr, sizeof(hdr),
-            "%12s  │  %26s  │  %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %14s  │  %14s",
+            "%12s  │  %-25s  │  %-25s  │  %-25s  │  %-21s",
             "ChunkSize", "Posix(warm) W / R MB/s",
-            "Posix(cold) W / R MB/s", nc, FLAGS_iodepth,
-            "Speedup W(cold)", "Speedup R(cold)");
+            "Posix(cold) W / R MB/s", spdk_col,
+            "Speedup(cold) W / R");
         std::cout << hdr << "\n";
-        PrintSeparator(180);
+        PrintSeparator(TW);
     } else {
-        PrintSeparator();
+        PrintSeparator(TW);
         char hdr[256];
         std::snprintf(hdr, sizeof(hdr),
-            "%12s  │  %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %20s",
-            "ChunkSize", "Posix Write / Read (MB/s)", nc, FLAGS_iodepth,
-            "Speedup W / R");
+            "%12s  │  %-25s  │  %-25s  │  %-18s",
+            "ChunkSize", "Posix Write / Read MB/s",
+            spdk_col, "Speedup W / R");
         std::cout << hdr << "\n";
-        PrintSeparator();
+        PrintSeparator(TW);
     }
 
     for (size_t chunk : chunk_sizes) {
@@ -926,24 +949,29 @@ static void RunFileSeqBench() {
         double sw = trimmed_mean(spdk_w), sr = trimmed_mean(spdk_r);
 
         if (on_real_disk) {
+            std::string c1 = FmtWR(pw, pr), c2 = FmtWR(pcw, pcr);
+            std::string c3 = FmtWR(sw, sr);
+            std::string c4 = FmtSpeedup(pcw > 0 ? sw / pcw : 0,
+                                         pcr > 0 ? sr / pcr : 0);
             char row[512];
             std::snprintf(row, sizeof(row),
-                "%12s  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  %12.2fx  │  %12.2fx",
-                FormatSize(chunk).c_str(), pw, pr, pcw, pcr, sw, sr,
-                pcw > 0 ? sw / pcw : 0,
-                pcr > 0 ? sr / pcr : 0);
+                "%12s  │  %-25s  │  %-25s  │  %-25s  │  %-21s",
+                FormatSize(chunk).c_str(),
+                c1.c_str(), c2.c_str(), c3.c_str(), c4.c_str());
             std::cout << row << "\n";
         } else {
+            std::string c1 = FmtWR(pw, pr), c2 = FmtWR(sw, sr);
+            std::string c3 = FmtSpeedup(pw > 0 ? sw / pw : 0,
+                                         pr > 0 ? sr / pr : 0);
             char row[256];
             std::snprintf(row, sizeof(row),
-                "%12s  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  "
-                "%6.2fx / %.2fx",
-                FormatSize(chunk).c_str(), pw, pr, sw, sr,
-                pw > 0 ? sw / pw : 0, pr > 0 ? sr / pr : 0);
+                "%12s  │  %-25s  │  %-25s  │  %-18s",
+                FormatSize(chunk).c_str(),
+                c1.c_str(), c2.c_str(), c3.c_str());
             std::cout << row << "\n";
         }
     }
-    PrintSeparator(on_real_disk ? 180 : 110);
+    PrintSeparator(TW);
 }
 
 // ============================================================================
@@ -956,9 +984,10 @@ static void RunFileRandBench() {
     const char *posix_mode = FLAGS_posix_direct ? "O_DIRECT" : "cached";
 
     bool on_real_disk = !FLAGS_nvme_pci_addr.empty();
+    const int TW = on_real_disk ? 128 : 95;
 
     std::cout << "\n";
-    PrintSeparator(on_real_disk ? 180 : 110);
+    PrintSeparator(TW);
     std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, SPDK=" << spdk_mode
               << ", Posix=" << posix_mode
               << ", cores=" << FLAGS_cores
@@ -974,25 +1003,29 @@ static void RunFileRandBench() {
 
     std::vector<int> ops_list = {10000, 50000, 200000};
 
+    char spdk_col[64];
+    std::snprintf(spdk_col, sizeof(spdk_col),
+                  "SPDK %dC QD=%d W/R MB/s", nc, FLAGS_iodepth);
+
     if (on_real_disk) {
-        PrintSeparator(180);
+        PrintSeparator(TW);
         char rhdr[512];
         std::snprintf(rhdr, sizeof(rhdr),
-            "%10s  │  %26s  │  %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %14s  │  %14s",
+            "%12s  │  %-25s  │  %-25s  │  %-25s  │  %-21s",
             "NumOps", "Posix(warm) W / R MB/s",
-            "Posix(cold) W / R MB/s", nc, FLAGS_iodepth,
-            "Speedup W(cold)", "Speedup R(cold)");
+            "Posix(cold) W / R MB/s", spdk_col,
+            "Speedup(cold) W / R");
         std::cout << rhdr << "\n";
-        PrintSeparator(180);
+        PrintSeparator(TW);
     } else {
-        PrintSeparator();
+        PrintSeparator(TW);
         char rhdr[512];
         std::snprintf(rhdr, sizeof(rhdr),
-            "%10s  │  %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %20s",
-            "NumOps", "Posix W / R (MB/s)", nc, FLAGS_iodepth,
-            "Speedup W / R");
+            "%12s  │  %-25s  │  %-25s  │  %-18s",
+            "NumOps", "Posix W / R MB/s",
+            spdk_col, "Speedup W / R");
         std::cout << rhdr << "\n";
-        PrintSeparator();
+        PrintSeparator(TW);
     }
 
     auto trimmed_mean_rand = [](std::vector<double> &v) -> double {
@@ -1066,23 +1099,27 @@ static void RunFileRandBench() {
         double sw = trimmed_mean_rand(sw_v), sr = trimmed_mean_rand(sr_v);
 
         if (on_real_disk) {
+            std::string c1 = FmtWR(pw, pr), c2 = FmtWR(pcw, pcr);
+            std::string c3 = FmtWR(sw, sr);
+            std::string c4 = FmtSpeedup(pcw > 0 ? sw / pcw : 0,
+                                         pcr > 0 ? sr / pcr : 0);
             char row[512];
             std::snprintf(row, sizeof(row),
-                "%10d  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  %12.2fx  │  %12.2fx",
-                num_ops, pw, pr, pcw, pcr, sw, sr,
-                pcw > 0 ? sw / pcw : 0, pcr > 0 ? sr / pcr : 0);
+                "%12d  │  %-25s  │  %-25s  │  %-25s  │  %-21s",
+                num_ops, c1.c_str(), c2.c_str(), c3.c_str(), c4.c_str());
             std::cout << row << "\n";
         } else {
+            std::string c1 = FmtWR(pw, pr), c2 = FmtWR(sw, sr);
+            std::string c3 = FmtSpeedup(pw > 0 ? sw / pw : 0,
+                                         pr > 0 ? sr / pr : 0);
             char row[512];
             std::snprintf(row, sizeof(row),
-                "%10d  │  %10.1f / %-10.1f   │  "
-                "%10.1f / %-10.1f   │  %6.2fx / %.2fx",
-                num_ops, pw, pr, sw, sr,
-                pw > 0 ? sw / pw : 0, pr > 0 ? sr / pr : 0);
+                "%12d  │  %-25s  │  %-25s  │  %-18s",
+                num_ops, c1.c_str(), c2.c_str(), c3.c_str());
             std::cout << row << "\n";
         }
     }
-    PrintSeparator(on_real_disk ? 180 : 110);
+    PrintSeparator(TW);
 
     // Latency comparison: 4KB random I/O at QD=1 (industry-standard latency test)
     constexpr int kLatencyOps = 50000;
@@ -1313,8 +1350,9 @@ static void RunBackendBench() {
     PrintSeparator();
 
     // Multi-value-size sweep
+    const int SW = on_real_disk ? 134 : 102;
     std::cout << "\n";
-    PrintSeparator();
+    PrintSeparator(SW);
     std::cout << "  BACKEND THROUGHPUT BY VALUE SIZE  (SPDK=" << spdk_mode
               << ", max_keys=" << num_keys
               << ", threads=" << threads
@@ -1322,27 +1360,28 @@ static void RunBackendBench() {
               << (on_real_disk ? ", cold=drop_caches" : "") << ")\n";
 
     if (on_real_disk) {
-        PrintSeparator(160);
+        PrintSeparator(SW);
         char shdr[512];
         std::snprintf(shdr, sizeof(shdr),
-                      "%12s  %5s  │  %10s / %-10s   │  %10s / %-10s   │"
-                      "  %10s / %-10s   │  %10s    │  %10s",
-                      "ValueSize", "Keys",
-                      "Posix O", "L(warm)",
-                      "Posix O", "L(cold)",
-                      "SPDK O", "L MB/s",
-                      "Speedup O", "L(cold)");
+            "%12s %5s  │  %-25s  │  %-25s  │  %-25s  │  %-21s",
+            "ValueSize", "Keys",
+            "Posix(warm) O / L MB/s",
+            "Posix(cold) O / L MB/s",
+            "SPDK O / L MB/s",
+            "Speedup O / L(cold)");
         std::cout << shdr << "\n";
-        PrintSeparator(160);
+        PrintSeparator(SW);
     } else {
-        PrintSeparator(120);
-        std::cout << std::setw(12) << "ValueSize"
-                  << std::setw(8) << "  Keys"
-                  << "  │ " << std::setw(26) << "Posix Offload / Load MB/s"
-                  << "  │ " << std::setw(26) << "SPDK  Offload / Load MB/s"
-                  << "  │ " << std::setw(20) << "Speedup O / L"
-                  << "\n";
-        PrintSeparator(120);
+        PrintSeparator(SW);
+        char shdr[512];
+        std::snprintf(shdr, sizeof(shdr),
+            "%12s %6s  │  %-25s  │  %-25s  │  %-18s",
+            "ValueSize", "Keys",
+            "Posix Offload / Load MB/s",
+            "SPDK Offload / Load MB/s",
+            "Speedup O / L");
+        std::cout << shdr << "\n";
+        PrintSeparator(SW);
     }
 
     std::vector<size_t> value_sizes = {
@@ -1454,35 +1493,155 @@ static void RunBackendBench() {
 
         if (on_real_disk) {
             double cold_lb = posix_cold_lb > 0 ? posix_cold_lb : posix_lb;
-            char row[512];
-            std::snprintf(
-                row, sizeof(row),
-                "%12s  %5zu  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │"
-                "  %10.1f / %-10.1f   │  %10.2fx    │  %10.2fx",
-                FormatSize(vsz).c_str(), effective_keys,
-                posix_ob, posix_lb,
-                posix_cold_ob, posix_cold_lb,
-                spdk_ob, spdk_lb,
+            std::string c1 = FmtWR(posix_ob, posix_lb);
+            std::string c2 = FmtWR(posix_cold_ob, posix_cold_lb);
+            std::string c3 = FmtWR(spdk_ob, spdk_lb);
+            std::string c4 = FmtSpeedup(
                 posix_ob > 0 ? spdk_ob / posix_ob : 0,
                 cold_lb > 0 ? spdk_lb / cold_lb : 0);
+            char row[512];
+            std::snprintf(row, sizeof(row),
+                "%12s %5zu  │  %-25s  │  %-25s  │  %-25s  │  %-21s",
+                FormatSize(vsz).c_str(), effective_keys,
+                c1.c_str(), c2.c_str(), c3.c_str(), c4.c_str());
             std::cout << row << "\n";
         } else {
-            char row[300];
-            std::snprintf(
-                row, sizeof(row),
-                "%12s  %5zu  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  "
-                "%6.2fx / %.2fx",
-                FormatSize(vsz).c_str(), effective_keys, posix_ob, posix_lb,
-                spdk_ob, spdk_lb,
+            std::string c1 = FmtWR(posix_ob, posix_lb);
+            std::string c2 = FmtWR(spdk_ob, spdk_lb);
+            std::string c3 = FmtSpeedup(
                 posix_ob > 0 ? spdk_ob / posix_ob : 0,
                 posix_lb > 0 ? spdk_lb / posix_lb : 0);
+            char row[300];
+            std::snprintf(row, sizeof(row),
+                "%12s %6zu  │  %-25s  │  %-25s  │  %-18s",
+                FormatSize(vsz).c_str(), effective_keys,
+                c1.c_str(), c2.c_str(), c3.c_str());
             std::cout << row << "\n";
         }
     }
-    if (on_real_disk)
-        PrintSeparator(160);
-    else
-        PrintSeparator();
+    PrintSeparator(SW);
+}
+
+// ============================================================================
+// Pipeline chunk size tuning benchmark
+// ============================================================================
+
+static void RunPipelineTuneBench() {
+    auto &env = SpdkEnv::Instance();
+    namespace fs = std::filesystem;
+    std::string spdk_dir =
+        (fs::temp_directory_path() / "spdk_bench_pipe").string();
+
+    std::vector<size_t> value_sizes = {
+        8ULL * 1024 * 1024, 16ULL * 1024 * 1024,
+        32ULL * 1024 * 1024, 64ULL * 1024 * 1024,
+        128ULL * 1024 * 1024};
+    std::vector<int> chunk_kbs = {512, 1024, 2048, 4096};
+
+    int threads = FLAGS_threads;
+    size_t num_keys = FLAGS_backend_keys;
+    constexpr int kIters = 2;
+
+    std::cout << "\n";
+    PrintSeparator(120);
+    std::cout << "  PIPELINE CHUNK SIZE TUNING  (threads=" << threads
+              << ", keys=" << num_keys << ", iterations=" << kIters << ")\n";
+    PrintSeparator(120);
+
+    // Header
+    std::cout << std::setw(12) << "ValueSize";
+    for (int ck : chunk_kbs) {
+        char label[32];
+        std::snprintf(label, sizeof(label), " │ chunk=%dKB O/L", ck);
+        std::cout << std::setw(28) << label;
+    }
+    std::cout << "\n";
+    PrintSeparator(120);
+
+    for (size_t vsz : value_sizes) {
+        uint64_t bdev_cap = env.GetBdevSize();
+        size_t per_key_overhead = vsz + 4096 + 64;
+        size_t effective_keys = num_keys;
+        if (per_key_overhead > 0) {
+            size_t max_keys = bdev_cap / per_key_overhead / 2;
+            if (max_keys < 4) max_keys = 4;
+            effective_keys = std::min(effective_keys, max_keys);
+        }
+        constexpr size_t kMaxTotalData = 512ULL * 1024 * 1024;
+        if (vsz > 0) {
+            size_t max_by_data = std::max<size_t>(2, kMaxTotalData / vsz);
+            effective_keys = std::min(effective_keys, max_by_data);
+        }
+
+        std::cout << std::setw(12) << FormatSize(vsz);
+
+        for (int ck : chunk_kbs) {
+            // Set pipeline params for this iteration
+            size_t thresh = std::min<size_t>(vsz, 4ULL * 1024 * 1024);
+            SpdkEnv::SetPipelineParams(thresh, static_cast<size_t>(ck) * 1024);
+
+            // Pre-warm DMA
+            size_t warm_size = spdk_align_up(vsz + 4096 + 64);
+            constexpr size_t kDmaBudget = 256ULL * 1024 * 1024;
+            int max_qd_total = warm_size > 0
+                ? std::max(4, static_cast<int>(kDmaBudget / warm_size))
+                : 128;
+            int per_thread_qd = std::max(4,
+                std::min(128, max_qd_total / std::max(1, threads)));
+            int sweep_qd = std::min(per_thread_qd,
+                                    static_cast<int>(effective_keys));
+            int total_warm = sweep_qd * threads;
+            env.DmaPoolDrain();
+            env.DmaPoolPrewarm(warm_size, total_warm, env.GetBlockSize());
+
+            std::vector<double> obs, lbs;
+            for (int iter = 0; iter < kIters; ++iter) {
+                fs::create_directories(spdk_dir);
+                FileStorageConfig config;
+                config.storage_filepath = spdk_dir;
+                config.storage_backend_type =
+                    StorageBackendType::kOffsetAllocator;
+                config.total_size_limit =
+                    static_cast<int64_t>(effective_keys * (vsz + 4096) * 2);
+                config.total_keys_limit =
+                    static_cast<int64_t>(effective_keys * 2);
+                config.use_spdk = true;
+                config.spdk_bdev_name = FLAGS_spdk_bdev_name;
+
+                OffsetAllocatorStorageBackend be(config);
+                if (be.Init().has_value()) {
+                    auto res = BenchBackend(be, effective_keys, vsz, threads,
+                                            false, false);
+                    obs.push_back(res.offload_bw_mbps);
+                    lbs.push_back(res.load_bw_mbps);
+                }
+                fs::remove_all(spdk_dir);
+            }
+            env.DmaPoolDrain();
+
+            double ob_avg = obs.empty() ? 0 :
+                std::accumulate(obs.begin(), obs.end(), 0.0) / obs.size();
+            double lb_avg = lbs.empty() ? 0 :
+                std::accumulate(lbs.begin(), lbs.end(), 0.0) / lbs.size();
+
+            char cell[64];
+            std::snprintf(cell, sizeof(cell), " │ %8.0f / %-8.0f",
+                          ob_avg, lb_avg);
+            std::cout << cell;
+        }
+        std::cout << "\n";
+    }
+    PrintSeparator(120);
+
+    // Restore original settings
+    size_t orig_thresh = FLAGS_pipeline_threshold_kb > 0
+        ? static_cast<size_t>(FLAGS_pipeline_threshold_kb) * 1024
+        : 4ULL * 1024 * 1024;
+    size_t orig_chunk = FLAGS_pipeline_chunk_kb > 0
+        ? static_cast<size_t>(FLAGS_pipeline_chunk_kb) * 1024
+        : 2ULL * 1024 * 1024;
+    SpdkEnv::SetPipelineParams(orig_thresh, orig_chunk);
+    std::cout << "\nRecommendation: pick the chunk size with highest Offload + Load sum.\n";
 }
 
 // ============================================================================
@@ -1492,7 +1651,7 @@ static void RunBackendBench() {
 int main(int argc, char **argv) {
     gflags::SetUsageMessage(
         "SPDK vs PosixFile performance benchmark.\n"
-        "  sudo ./spdk_bench [--test=all|file_seq|file_rand|backend] "
+        "  sudo ./spdk_bench [--test=all|file_seq|file_rand|backend|pipeline_tune] "
         "[--iterations=5] ...");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     google::InitGoogleLogging(argv[0]);
@@ -1501,6 +1660,8 @@ int main(int argc, char **argv) {
     SpdkEnvConfig cfg;
     cfg.reactor_mask = BuildCoreMask(FLAGS_cores);
     cfg.mem_size_mb = FLAGS_mem_size_mb;
+    cfg.pipeline_chunk_kb = FLAGS_pipeline_chunk_kb;
+    cfg.pipeline_threshold_kb = FLAGS_pipeline_threshold_kb;
 
     if (!FLAGS_nvme_pci_addr.empty()) {
         cfg.use_malloc_bdev = false;
@@ -1537,6 +1698,7 @@ int main(int argc, char **argv) {
     if (test == "all" || test == "file_seq") RunFileSeqBench();
     if (test == "all" || test == "file_rand") RunFileRandBench();
     if (test == "all" || test == "backend") RunBackendBench();
+    if (test == "pipeline_tune") RunPipelineTuneBench();
 
     SpdkEnv::Instance().Shutdown();
     std::cout << "\nDone.\n";

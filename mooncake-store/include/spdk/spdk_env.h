@@ -43,6 +43,12 @@ struct SpdkEnvConfig {
 
     // Limit DPDK hugepage memory (MB). 0 = use all available hugepages.
     int mem_size_mb = 0;
+
+    // Chunked DMA+memcpy pipeline for large values.
+    // pipeline_chunk_kb: double-buffer chunk size (KB). 0 = use default (2048).
+    // pipeline_threshold_kb: minimum aligned size to enable pipeline (KB). 0 = use default (4096).
+    int pipeline_chunk_kb = 0;
+    int pipeline_threshold_kb = 0;
 };
 
 struct SpdkIoRequest {
@@ -95,6 +101,10 @@ class SpdkEnv {
     uint32_t GetBlockSize() const { return block_size_; }
     uint64_t GetBdevSize() const { return bdev_size_; }
     int GetNumReactors() const { return num_reactors_; }
+
+    size_t GetPipelineChunk() const;
+    size_t GetPipelineThreshold() const;
+    static void SetPipelineParams(size_t threshold, size_t chunk);
 
     void *DmaMalloc(size_t size, size_t align = 4096);
     void DmaFree(void *buf);

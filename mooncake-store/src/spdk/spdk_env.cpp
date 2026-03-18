@@ -21,6 +21,8 @@ extern "C" {
 #define SPDK_DESC(p) (static_cast<struct spdk_bdev_desc *>(p))
 #define SPDK_CHAN(p) (static_cast<struct spdk_io_channel *>(p))
 
+// SpdkEnv::SetPipelineParams declared in spdk_env.h, defined in spdk_file.cpp
+
 // ---------------------------------------------------------------------------
 // File-local helpers
 // ---------------------------------------------------------------------------
@@ -393,6 +395,20 @@ int SpdkEnv::Init(const SpdkEnvConfig &config) {
     }
 
     initialized_.store(true, std::memory_order_release);
+
+    // Apply pipeline chunk/threshold from config
+    {
+        size_t thresh = config_.pipeline_threshold_kb > 0
+            ? static_cast<size_t>(config_.pipeline_threshold_kb) * 1024
+            : 4ULL * 1024 * 1024;
+        size_t chunk = config_.pipeline_chunk_kb > 0
+            ? static_cast<size_t>(config_.pipeline_chunk_kb) * 1024
+            : 2ULL * 1024 * 1024;
+        SpdkEnv::SetPipelineParams(thresh, chunk);
+        LOG(INFO) << "SpdkEnv: pipeline chunk=" << chunk / 1024
+                  << "KB threshold=" << thresh / 1024 << "KB";
+    }
+
     LOG(INFO) << "SpdkEnv: initialization complete — "
               << num_reactors_ << " reactor(s)";
     return 0;
