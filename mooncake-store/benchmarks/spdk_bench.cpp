@@ -596,6 +596,9 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
     }
 
     // --- Offload (write) — batch ALL keys per thread ---
+    // Reduce threads if fewer keys than threads to avoid empty batches
+    if (static_cast<size_t>(threads) > num_keys)
+        threads = std::max(1, static_cast<int>(num_keys));
     size_t keys_per_thread = num_keys / threads;
     std::vector<LatencyStats> w_latencies(threads);
     std::vector<int64_t> w_counts(threads, 0);
@@ -788,15 +791,16 @@ static void RunFileSeqBench() {
     auto &env = SpdkEnv::Instance();
     const char *spdk_mode = FLAGS_nvme_pci_addr.empty() ? "malloc" : "NVMe";
     const char *posix_mode = FLAGS_posix_direct ? "O_DIRECT" : "cached";
+    bool on_real_disk = !FLAGS_nvme_pci_addr.empty();
 
     std::cout << "\n";
-    PrintSeparator();
+    PrintSeparator(on_real_disk ? 160 : 110);
     std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (SPDK=" << spdk_mode
               << ", Posix=" << posix_mode
               << ", cores=" << FLAGS_cores
               << ", iodepth=" << FLAGS_iodepth
-              << ", iterations=" << FLAGS_iterations << ")\n";
-    PrintSeparator();
+              << ", iterations=" << FLAGS_iterations
+              << (on_real_disk ? ", cold=drop_caches" : "") << ")\n";
 
     std::vector<size_t> chunk_sizes = {
         4096,               64 * 1024,          256 * 1024,
@@ -811,13 +815,35 @@ static void RunFileSeqBench() {
 
     int nc = env.GetNumReactors();
 
-    char hdr[256];
-    std::snprintf(hdr, sizeof(hdr),
-                  "%12s  │ %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │ %20s",
-                  "ChunkSize", "Posix Write / Read (MB/s)", nc, FLAGS_iodepth,
-                  "Speedup W / R");
-    std::cout << hdr << "\n";
-    PrintSeparator();
+    auto trimmed_mean = [](std::vector<double> &v) -> double {
+        std::sort(v.begin(), v.end());
+        if (v.size() <= 2)
+            return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+        double sum = 0;
+        for (size_t i = 1; i + 1 < v.size(); ++i) sum += v[i];
+        return sum / (v.size() - 2);
+    };
+
+    if (on_real_disk) {
+        PrintSeparator(160);
+        char hdr[512];
+        std::snprintf(hdr, sizeof(hdr),
+            "%12s  │  %26s  │  %14s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %10s  │  %14s",
+            "ChunkSize", "Posix W / R(warm) MB/s",
+            "Posix R(cold)", nc, FLAGS_iodepth,
+            "Speedup W", "Speedup R(cold)");
+        std::cout << hdr << "\n";
+        PrintSeparator(160);
+    } else {
+        PrintSeparator();
+        char hdr[256];
+        std::snprintf(hdr, sizeof(hdr),
+            "%12s  │  %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %20s",
+            "ChunkSize", "Posix Write / Read (MB/s)", nc, FLAGS_iodepth,
+            "Speedup W / R");
+        std::cout << hdr << "\n";
+        PrintSeparator();
+    }
 
     for (size_t chunk : chunk_sizes) {
         if (chunk > total_data) {
@@ -829,12 +855,13 @@ static void RunFileSeqBench() {
         size_t effective_total = std::max(total_data, chunk * 4);
         if (effective_total > bdev_size) effective_total = total_data;
 
-        std::vector<double> posix_w, posix_r, spdk_w, spdk_r;
+        std::vector<double> posix_w, posix_r, posix_cold_r;
+        std::vector<double> spdk_w, spdk_r;
 
         for (int iter = 0; iter < FLAGS_iterations; ++iter) {
             bool verify_this = FLAGS_verify && (iter == 0);
 
-            // --- Posix (sync preadv/pwritev) ---
+            // --- Posix warm (write then read — page cache hot) ---
             {
                 int fd = open(FLAGS_posix_path.c_str(),
                               OpenPosixFlags(true), 0644);
@@ -851,9 +878,23 @@ static void RunFileSeqBench() {
                 PosixFile pf(FLAGS_posix_path, fd);
 
                 auto wr = BenchFileSeq(pf, chunk, effective_total, true, false);
-                auto rd = BenchFileSeq(pf, chunk, effective_total, false, verify_this);
+                auto rd = BenchFileSeq(pf, chunk, effective_total, false,
+                                       verify_this);
                 posix_w.push_back(wr.BW_MBps());
                 posix_r.push_back(rd.BW_MBps());
+            }
+
+            // --- Posix cold read (drop page cache, re-read) ---
+            if (on_real_disk) {
+                DropPageCache();
+                int fd = open(FLAGS_posix_path.c_str(),
+                              OpenPosixFlags(false), 0644);
+                if (fd >= 0) {
+                    PosixFile pf(FLAGS_posix_path, fd);
+                    auto rd = BenchFileSeq(pf, chunk, effective_total, false,
+                                           false);
+                    posix_cold_r.push_back(rd.BW_MBps());
+                }
             }
             unlink(FLAGS_posix_path.c_str());
 
@@ -868,28 +909,30 @@ static void RunFileSeqBench() {
             }
         }
 
-        auto trimmed_mean = [](std::vector<double> &v) -> double {
-            std::sort(v.begin(), v.end());
-            if (v.size() <= 2) {
-                return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
-            }
-            double sum = 0;
-            for (size_t i = 1; i + 1 < v.size(); ++i) sum += v[i];
-            return sum / (v.size() - 2);
-        };
-
         double pw = trimmed_mean(posix_w), pr = trimmed_mean(posix_r);
         double sw = trimmed_mean(spdk_w), sr = trimmed_mean(spdk_r);
+        double pcr = posix_cold_r.empty() ? 0 : trimmed_mean(posix_cold_r);
 
-        char row[256];
-        std::snprintf(row, sizeof(row),
-                      "%12s  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  "
-                      "%6.2fx / %.2fx",
-                      FormatSize(chunk).c_str(), pw, pr, sw, sr,
-                      pw > 0 ? sw / pw : 0, pr > 0 ? sr / pr : 0);
-        std::cout << row << "\n";
+        if (on_real_disk) {
+            double cold_r = pcr > 0 ? pcr : pr;
+            char row[512];
+            std::snprintf(row, sizeof(row),
+                "%12s  │  %10.1f / %-10.1f   │  %10.1f     │  %10.1f / %-10.1f   │  %8.2fx  │  %12.2fx",
+                FormatSize(chunk).c_str(), pw, pr, pcr, sw, sr,
+                pw > 0 ? sw / pw : 0,
+                cold_r > 0 ? sr / cold_r : 0);
+            std::cout << row << "\n";
+        } else {
+            char row[256];
+            std::snprintf(row, sizeof(row),
+                "%12s  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  "
+                "%6.2fx / %.2fx",
+                FormatSize(chunk).c_str(), pw, pr, sw, sr,
+                pw > 0 ? sw / pw : 0, pr > 0 ? sr / pr : 0);
+            std::cout << row << "\n";
+        }
     }
-    PrintSeparator();
+    PrintSeparator(on_real_disk ? 160 : 110);
 }
 
 // ============================================================================
