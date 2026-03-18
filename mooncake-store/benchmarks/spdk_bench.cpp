@@ -49,7 +49,7 @@ DEFINE_string(spdk_bdev_name, "BenchMalloc0",
               "SPDK bdev name (default: auto-created malloc bdev)");
 DEFINE_uint64(spdk_malloc_mb, 1024,
               "Size of SPDK malloc bdev in MB (default: 1024)");
-DEFINE_int32(iterations, 5,
+DEFINE_int32(iterations, 3,
              "Iterations per data point (min/max trimmed, report mean of rest)");
 DEFINE_string(test, "all",
               "Which test to run: file_seq, file_rand, backend, all");
@@ -331,14 +331,22 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
 
     auto dma_bufs = std::make_unique<void *[]>(iodepth);
     auto reqs = std::make_unique<SpdkIoRequest[]>(iodepth);
+    int actual_qd = 0;
     for (int i = 0; i < iodepth; ++i) {
         dma_bufs[i] = env.DmaMalloc(aligned_chunk, env.GetBlockSize());
-        if (!dma_bufs[i]) {
-            LOG(ERROR) << "DmaMalloc failed for slot " << i;
-            for (int j = 0; j < i; ++j) env.DmaFree(dma_bufs[j]);
-            return {};
-        }
+        if (!dma_bufs[i]) break;
+        ++actual_qd;
     }
+    if (actual_qd == 0) {
+        LOG(ERROR) << "DmaMalloc failed for chunk=" << FormatSize(chunk_size)
+                   << ", cannot run SPDK test";
+        return {};
+    }
+    if (actual_qd < iodepth) {
+        LOG(WARNING) << "DmaMalloc partial " << actual_qd << "/" << iodepth
+                     << " for chunk=" << FormatSize(chunk_size);
+    }
+    iodepth = actual_qd;
 
     auto src_bufs = std::make_unique<std::vector<char>[]>(iodepth);
     if (is_write) {
@@ -445,13 +453,22 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
 
     auto dma_bufs = std::make_unique<void *[]>(iodepth);
     auto reqs = std::make_unique<SpdkIoRequest[]>(iodepth);
+    int actual_qd = 0;
     for (int i = 0; i < iodepth; ++i) {
         dma_bufs[i] = env.DmaMalloc(aligned_io, env.GetBlockSize());
-        if (!dma_bufs[i]) {
-            for (int j = 0; j < i; ++j) env.DmaFree(dma_bufs[j]);
-            return {};
-        }
+        if (!dma_bufs[i]) break;
+        ++actual_qd;
     }
+    if (actual_qd == 0) {
+        LOG(ERROR) << "DmaMalloc failed for io=" << FormatSize(io_size)
+                   << ", cannot run SPDK random test";
+        return {};
+    }
+    if (actual_qd < iodepth) {
+        LOG(WARNING) << "DmaMalloc partial " << actual_qd << "/" << iodepth
+                     << " for io=" << FormatSize(io_size);
+    }
+    iodepth = actual_qd;
 
     auto src_bufs = std::make_unique<std::vector<char>[]>(iodepth);
     if (is_write) {
@@ -789,8 +806,8 @@ static void RunFileSeqBench() {
 
     uint64_t bdev_size = env.GetBdevSize();
     size_t total_data = bdev_size / 2;
-    if (total_data > 512ULL * 1024 * 1024)
-        total_data = 512ULL * 1024 * 1024;
+    if (total_data > 256ULL * 1024 * 1024)
+        total_data = 256ULL * 1024 * 1024;
 
     int nc = env.GetNumReactors();
 
@@ -1203,10 +1220,10 @@ static void RunBackendBench() {
             effective_keys = std::min(effective_keys, max_keys);
         }
 
-        // Cap total data per test to ~1GB for fast sweep
-        constexpr size_t kMaxTotalData = 1ULL * 1024 * 1024 * 1024;
+        // Cap total data per test to ~512MB for fast sweep
+        constexpr size_t kMaxTotalData = 512ULL * 1024 * 1024;
         if (vsz > 0) {
-            size_t max_by_data = std::max<size_t>(4, kMaxTotalData / vsz);
+            size_t max_by_data = std::max<size_t>(2, kMaxTotalData / vsz);
             effective_keys = std::min(effective_keys, max_by_data);
         }
 
