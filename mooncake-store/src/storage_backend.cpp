@@ -2527,11 +2527,15 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             }
         }
 
-        // Create allocator with base=0, size=capacity
+        // Create allocator with base=0, size=capacity.
+        // Use max(block_size, 4096) so allocations align to both the device's
+        // logical block size and the SSD's internal NAND page size (>=4K).
 #ifdef USE_SPDK
         if (file_storage_config_.use_spdk) {
+            size_t align = std::max<size_t>(
+                SpdkEnv::Instance().GetBlockSize(), 4096);
             allocator_ = offset_allocator::OffsetAllocator::createAligned(
-                0, capacity_, SpdkEnv::Instance().GetBlockSize());
+                0, capacity_, align);
         } else
 #endif
         {

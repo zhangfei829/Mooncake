@@ -308,10 +308,11 @@ class SpdkFile : public StorageFile {
         const BatchWriteEntry *entries, int count) override;
 
    private:
-    static constexpr size_t BLOCK_ALIGN = 4096;
+    static constexpr size_t kMinPageAlign = 4096;
 
-    static size_t align_up(size_t v) {
-        return (v + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
+    size_t align_up(size_t v) const {
+        size_t a = block_size_ >= kMinPageAlign ? block_size_ : kMinPageAlign;
+        return (v + a - 1) & ~(a - 1);
     }
 
     void *AcquireDmaBuf(size_t needed);

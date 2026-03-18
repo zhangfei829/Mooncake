@@ -258,11 +258,10 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
     auto dma_bufs = std::make_unique<void *[]>(qd);
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
                                     block_size_);
-    if (got < qd) {
-        for (int j = 0; j < got; ++j)
-            env.DmaPoolFree(dma_bufs[j], max_aligned);
+    if (got == 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+    qd = got;
 
     auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
     auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
@@ -359,11 +358,10 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
     auto dma_bufs = std::make_unique<void *[]>(qd);
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
                                     block_size_);
-    if (got < qd) {
-        for (int j = 0; j < got; ++j)
-            env.DmaPoolFree(dma_bufs[j], max_aligned);
+    if (got == 0) {
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
+    qd = got;
 
     auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
     auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);

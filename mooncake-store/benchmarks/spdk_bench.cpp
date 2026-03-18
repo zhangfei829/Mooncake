@@ -314,7 +314,8 @@ static BandwidthResult BenchFileRand(StorageFile &file, size_t io_size,
 // ============================================================================
 
 static size_t spdk_align_up(size_t v) {
-    return (v + 4095) & ~4095UL;
+    size_t a = std::max<size_t>(SpdkEnv::Instance().GetBlockSize(), 4096);
+    return (v + a - 1) & ~(a - 1);
 }
 
 static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
@@ -1134,7 +1135,7 @@ static void RunBackendBench() {
         char row[256];
         std::snprintf(
             row, sizeof(row),
-            "%14s  │  %10.1f     │  %10.1f     │  %10.1f     │  %10.1f",
+            "%14s  │  %14.1f  │  %14.1f  │  %14.1f  │  %14.1f",
             label.c_str(), ob, lb, offload_lat_agg.Percentile(99),
             load_lat_agg.Percentile(99));
         std::cout << row << "\n";
@@ -1161,12 +1162,13 @@ static void RunBackendBench() {
         PrintSeparator(160);
         char shdr[512];
         std::snprintf(shdr, sizeof(shdr),
-                      "%12s %5s  │  %26s  │  %26s  │  %26s  │  %14s  │  %14s",
+                      "%12s  %5s  │  %10s / %-10s   │  %10s / %-10s   │"
+                      "  %10s / %-10s   │  %10s    │  %10s",
                       "ValueSize", "Keys",
-                      "Posix O / L(warm) MB/s",
-                      "Posix O / L(cold) MB/s",
-                      "SPDK  O / L MB/s",
-                      "Speedup O", "Speedup L(cold)");
+                      "Posix O", "L(warm)",
+                      "Posix O", "L(cold)",
+                      "SPDK O", "L MB/s",
+                      "Speedup O", "L(cold)");
         std::cout << shdr << "\n";
         PrintSeparator(160);
     } else {
