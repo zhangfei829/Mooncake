@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <filesystem>
 #include <iomanip>
@@ -59,7 +60,8 @@ DEFINE_uint64(backend_keys, 2000,
 DEFINE_uint64(backend_value_kb, 128,
               "Value size in KB for backend test (default: 128)");
 DEFINE_int32(threads, 1,
-             "Thread count for concurrent backend test (default: 1)");
+             "Thread count for Posix file-level I/O and backend tests (default: 1). "
+             "Match to SPDK cores for fair comparison.");
 DEFINE_int32(iodepth, 128,
              "I/O queue depth for SPDK async benchmarks (default: 128)");
 DEFINE_int32(cores, 2,
@@ -207,122 +209,183 @@ static void FillPattern(char *buf, size_t len, uint32_t seed) {
 // Part 1: StorageFile-level sequential bandwidth + latency
 // ============================================================================
 
-static BandwidthResult BenchFileSeq(StorageFile &file, size_t chunk_size,
-                                    size_t total_bytes, bool is_write,
-                                    bool do_verify) {
+// Single-thread worker operating on [range_start, range_start + range_bytes).
+static BandwidthResult BenchFileSeqWorker(int fd, size_t chunk_size,
+                                          off_t range_start,
+                                          size_t range_bytes, bool is_write,
+                                          bool do_verify) {
     BandwidthResult result;
-    size_t remaining = total_bytes;
-    off_t offset = 0;
+    size_t remaining = range_bytes;
+    off_t offset = range_start;
 
     AlignedBuf buf(chunk_size);
     AlignedBuf verify_buf(do_verify ? chunk_size : 0);
-
-    auto wall_t0 = Clock::now();
 
     while (remaining > 0) {
         size_t this_chunk = std::min(chunk_size, remaining);
 
         if (is_write) {
             FillPattern(buf.data(), this_chunk, static_cast<uint32_t>(offset));
-
-            auto t0 = Clock::now();
             iovec iov{buf.data(), this_chunk};
-            auto res = file.vector_write(&iov, 1, offset);
-            auto t1 = Clock::now();
-
-            if (!res.has_value() || res.value() != this_chunk) {
+            ssize_t ret = ::pwritev(fd, &iov, 1, offset);
+            if (ret < 0 || static_cast<size_t>(ret) != this_chunk) {
                 LOG(ERROR) << "Write failed at offset " << offset;
                 break;
             }
-            double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-            result.latency.Add(us);
             result.total_bytes += this_chunk;
         } else {
             iovec iov{buf.data(), this_chunk};
-
-            auto t0 = Clock::now();
-            auto res = file.vector_read(&iov, 1, offset);
-            auto t1 = Clock::now();
-
-            if (!res.has_value() || res.value() != this_chunk) {
+            ssize_t ret = ::preadv(fd, &iov, 1, offset);
+            if (ret < 0 || static_cast<size_t>(ret) != this_chunk) {
                 LOG(ERROR) << "Read failed at offset " << offset;
                 break;
             }
-            double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-            result.latency.Add(us);
             result.total_bytes += this_chunk;
 
             if (do_verify) {
                 FillPattern(verify_buf.data(), this_chunk,
                             static_cast<uint32_t>(offset));
-                if (std::memcmp(buf.data(), verify_buf.data(), this_chunk) != 0) {
+                if (std::memcmp(buf.data(), verify_buf.data(), this_chunk) != 0)
                     LOG(ERROR) << "Verify FAILED at offset " << offset;
-                }
             }
         }
         offset += this_chunk;
         remaining -= this_chunk;
     }
-
-    auto wall_t1 = Clock::now();
-    result.total_secs =
-        std::chrono::duration<double>(wall_t1 - wall_t0).count();
-    result.latency.Sort();
     return result;
+}
+
+// Multi-threaded Posix sequential benchmark.  N threads share the same fd,
+// each operating on a disjoint range.
+static BandwidthResult BenchFileSeqMT(int fd, size_t chunk_size,
+                                      size_t total_bytes, bool is_write,
+                                      bool do_verify, int nthreads) {
+    if (nthreads <= 1) {
+        auto wall_t0 = Clock::now();
+        auto r = BenchFileSeqWorker(fd, chunk_size, 0, total_bytes,
+                                    is_write, do_verify);
+        auto wall_t1 = Clock::now();
+        r.total_secs = std::chrono::duration<double>(wall_t1 - wall_t0).count();
+        return r;
+    }
+
+    // Align per-thread range to chunk_size boundary
+    size_t per_thread = (total_bytes / nthreads / chunk_size) * chunk_size;
+    std::vector<BandwidthResult> results(nthreads);
+
+    auto wall_t0 = Clock::now();
+    {
+        std::vector<std::thread> pool;
+        for (int t = 0; t < nthreads; ++t) {
+            off_t start = static_cast<off_t>(t) * static_cast<off_t>(per_thread);
+            size_t bytes = (t == nthreads - 1)
+                ? (total_bytes - start) : per_thread;
+            pool.emplace_back([&results, fd, chunk_size, start, bytes,
+                               is_write, do_verify, t]() {
+                results[t] = BenchFileSeqWorker(fd, chunk_size, start, bytes,
+                                                is_write, do_verify);
+            });
+        }
+        for (auto &th : pool) th.join();
+    }
+    auto wall_t1 = Clock::now();
+
+    BandwidthResult merged;
+    merged.total_secs =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
+    for (auto &r : results) merged.total_bytes += r.total_bytes;
+    return merged;
 }
 
 // ============================================================================
 // Part 2: StorageFile-level random I/O (IOPS + latency)
 // ============================================================================
 
-static BandwidthResult BenchFileRand(StorageFile &file, size_t io_size,
-                                     size_t file_size, int num_ops,
-                                     bool is_write) {
+static BandwidthResult BenchFileRandWorker(int fd, size_t io_size,
+                                           size_t file_size, int num_ops,
+                                           bool is_write, uint32_t seed,
+                                           bool collect_latency = false) {
     BandwidthResult result;
     size_t block_align = 4096;
     size_t max_offset = (file_size - io_size) / block_align * block_align;
 
-    std::mt19937 gen(12345);
+    std::mt19937 gen(seed);
     std::uniform_int_distribution<size_t> dist(0, max_offset / block_align);
 
     AlignedBuf buf(io_size);
-
-    auto wall_t0 = Clock::now();
 
     for (int i = 0; i < num_ops; ++i) {
         off_t offset = static_cast<off_t>(dist(gen) * block_align);
 
         if (is_write) {
-            FillPattern(buf.data(), io_size, static_cast<uint32_t>(offset ^ i));
+            FillPattern(buf.data(), io_size,
+                        static_cast<uint32_t>(offset ^ i));
             iovec iov{buf.data(), io_size};
-
             auto t0 = Clock::now();
-            auto res = file.vector_write(&iov, 1, offset);
+            ssize_t ret = ::pwritev(fd, &iov, 1, offset);
             auto t1 = Clock::now();
-
-            if (!res.has_value()) break;
-            double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-            result.latency.Add(us);
+            if (ret < 0) break;
             result.total_bytes += io_size;
+            if (collect_latency)
+                result.latency.Add(
+                    std::chrono::duration<double, std::micro>(t1 - t0).count());
         } else {
             iovec iov{buf.data(), io_size};
-
             auto t0 = Clock::now();
-            auto res = file.vector_read(&iov, 1, offset);
+            ssize_t ret = ::preadv(fd, &iov, 1, offset);
             auto t1 = Clock::now();
-
-            if (!res.has_value()) break;
-            double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
-            result.latency.Add(us);
+            if (ret < 0) break;
             result.total_bytes += io_size;
+            if (collect_latency)
+                result.latency.Add(
+                    std::chrono::duration<double, std::micro>(t1 - t0).count());
         }
     }
-
-    auto wall_t1 = Clock::now();
-    result.total_secs =
-        std::chrono::duration<double>(wall_t1 - wall_t0).count();
-    result.latency.Sort();
+    result.total_ops = num_ops;
     return result;
+}
+
+static BandwidthResult BenchFileRandMT(int fd, size_t io_size,
+                                       size_t file_size, int num_ops,
+                                       bool is_write, int nthreads) {
+    if (nthreads <= 1) {
+        auto wall_t0 = Clock::now();
+        auto r = BenchFileRandWorker(fd, io_size, file_size, num_ops,
+                                     is_write, 12345, true);
+        auto wall_t1 = Clock::now();
+        r.total_secs = std::chrono::duration<double>(wall_t1 - wall_t0).count();
+        r.latency.Sort();
+        return r;
+    }
+
+    int ops_per_thread = num_ops / nthreads;
+    std::vector<BandwidthResult> results(nthreads);
+
+    auto wall_t0 = Clock::now();
+    {
+        std::vector<std::thread> pool;
+        for (int t = 0; t < nthreads; ++t) {
+            int ops = (t == nthreads - 1)
+                ? (num_ops - ops_per_thread * t) : ops_per_thread;
+            uint32_t seed = 12345 + t;
+            pool.emplace_back([&results, fd, io_size, file_size, ops,
+                               is_write, seed, t]() {
+                results[t] = BenchFileRandWorker(fd, io_size, file_size, ops,
+                                                 is_write, seed);
+            });
+        }
+        for (auto &th : pool) th.join();
+    }
+    auto wall_t1 = Clock::now();
+
+    BandwidthResult merged;
+    merged.total_secs =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
+    for (auto &r : results) {
+        merged.total_bytes += r.total_bytes;
+        merged.total_ops += r.total_ops;
+    }
+    return merged;
 }
 
 // ============================================================================
@@ -394,6 +457,8 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
                submitted < total_ops) {
             int slot = head;
 
+            reqs[slot].completed.store(false, std::memory_order_relaxed);
+            reqs[slot].success = false;
             reqs[slot].op =
                 is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
             reqs[slot].buf = dma_bufs[slot];
@@ -520,6 +585,8 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
             int slot = head;
             off_t off = offsets[submitted];
 
+            reqs[slot].completed.store(false, std::memory_order_relaxed);
+            reqs[slot].success = false;
             reqs[slot].op =
                 is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
             reqs[slot].buf = dma_bufs[slot];
@@ -815,7 +882,7 @@ static void RunFileSeqBench() {
     std::cout << "\n";
     PrintSeparator(TW);
     std::cout << "  FILE-LEVEL SEQUENTIAL BANDWIDTH   (SPDK=" << spdk_mode
-              << ", Posix=" << posix_mode
+              << ", Posix=" << posix_mode << " T=" << FLAGS_threads
               << ", cores=" << FLAGS_cores
               << ", iodepth=" << FLAGS_iodepth
               << ", iterations=" << FLAGS_iterations
@@ -896,12 +963,13 @@ static void RunFileSeqBench() {
                     close(fd);
                     return;
                 }
-                PosixFile pf(FLAGS_posix_path, fd);
-                auto wr = BenchFileSeq(pf, chunk, effective_total, true, false);
-                auto rd = BenchFileSeq(pf, chunk, effective_total, false,
-                                       verify_this);
+                auto wr = BenchFileSeqMT(fd, chunk, effective_total, true,
+                                         false, FLAGS_threads);
+                auto rd = BenchFileSeqMT(fd, chunk, effective_total, false,
+                                         verify_this, FLAGS_threads);
                 posix_w.push_back(wr.BW_MBps());
                 posix_r.push_back(rd.BW_MBps());
+                close(fd);
             }
 
             // --- Posix cold (drop cache, then write + read from disk) ---
@@ -912,10 +980,10 @@ static void RunFileSeqBench() {
                                   OpenPosixFlags(true), 0644);
                     if (fd >= 0) {
                         ftruncate(fd, effective_total);
-                        PosixFile pf(FLAGS_posix_path, fd);
-                        auto wr = BenchFileSeq(pf, chunk, effective_total,
-                                               true, false);
+                        auto wr = BenchFileSeqMT(fd, chunk, effective_total,
+                                                 true, false, FLAGS_threads);
                         posix_cold_w.push_back(wr.BW_MBps());
+                        close(fd);
                     }
                 }
                 DropPageCache();
@@ -923,10 +991,10 @@ static void RunFileSeqBench() {
                     int fd = open(FLAGS_posix_path.c_str(),
                                   OpenPosixFlags(false), 0644);
                     if (fd >= 0) {
-                        PosixFile pf(FLAGS_posix_path, fd);
-                        auto rd = BenchFileSeq(pf, chunk, effective_total,
-                                               false, false);
+                        auto rd = BenchFileSeqMT(fd, chunk, effective_total,
+                                                 false, false, FLAGS_threads);
                         posix_cold_r.push_back(rd.BW_MBps());
+                        close(fd);
                     }
                 }
             }
@@ -989,7 +1057,7 @@ static void RunFileRandBench() {
     std::cout << "\n";
     PrintSeparator(TW);
     std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, SPDK=" << spdk_mode
-              << ", Posix=" << posix_mode
+              << ", Posix=" << posix_mode << " T=" << FLAGS_threads
               << ", cores=" << FLAGS_cores
               << ", iodepth=" << FLAGS_iodepth
               << ", iterations=" << FLAGS_iterations
@@ -1047,8 +1115,9 @@ static void RunFileRandBench() {
                               OpenPosixFlags(true), 0644);
                 if (fd >= 0) {
                     ftruncate(fd, file_size);
-                    PosixFile pf(FLAGS_posix_path, fd);
-                    BenchFileSeq(pf, 1024 * 1024, file_size, true, false);
+                    BenchFileSeqMT(fd, 1024 * 1024, file_size, true,
+                                   false, 1);
+                    close(fd);
                 }
             }
             BenchSpdkSeqAsync(1024 * 1024, file_size, true, false,
@@ -1058,11 +1127,15 @@ static void RunFileRandBench() {
             {
                 int fd = open(FLAGS_posix_path.c_str(),
                               OpenPosixFlags(false), 0644);
-                PosixFile pf(FLAGS_posix_path, fd);
-                auto wr = BenchFileRand(pf, 4096, file_size, num_ops, true);
-                auto rd = BenchFileRand(pf, 4096, file_size, num_ops, false);
-                pw_v.push_back(wr.BW_MBps());
-                pr_v.push_back(rd.BW_MBps());
+                if (fd >= 0) {
+                    auto wr = BenchFileRandMT(fd, 4096, file_size, num_ops,
+                                              true, FLAGS_threads);
+                    auto rd = BenchFileRandMT(fd, 4096, file_size, num_ops,
+                                              false, FLAGS_threads);
+                    pw_v.push_back(wr.BW_MBps());
+                    pr_v.push_back(rd.BW_MBps());
+                    close(fd);
+                }
             }
 
             // Posix cold random
@@ -1071,13 +1144,13 @@ static void RunFileRandBench() {
                 int fd = open(FLAGS_posix_path.c_str(),
                               OpenPosixFlags(false), 0644);
                 if (fd >= 0) {
-                    PosixFile pf(FLAGS_posix_path, fd);
-                    auto wr = BenchFileRand(pf, 4096, file_size, num_ops,
-                                            true);
-                    auto rd = BenchFileRand(pf, 4096, file_size, num_ops,
-                                            false);
+                    auto wr = BenchFileRandMT(fd, 4096, file_size, num_ops,
+                                              true, FLAGS_threads);
+                    auto rd = BenchFileRandMT(fd, 4096, file_size, num_ops,
+                                              false, FLAGS_threads);
                     pcw_v.push_back(wr.BW_MBps());
                     pcr_v.push_back(rd.BW_MBps());
+                    close(fd);
                 }
             }
             unlink(FLAGS_posix_path.c_str());
@@ -1154,33 +1227,37 @@ static void RunFileRandBench() {
         int fd = open(FLAGS_posix_path.c_str(), OpenPosixFlags(true), 0644);
         if (fd >= 0) {
             ftruncate(fd, file_size);
-            PosixFile pf(FLAGS_posix_path, fd);
-            BenchFileSeq(pf, 1024 * 1024, file_size, true, false);
+            BenchFileSeqMT(fd, 1024 * 1024, file_size, true, false, 1);
+            close(fd);
         }
     }
     BenchSpdkSeqAsync(1024 * 1024, file_size, true, false, FLAGS_iodepth);
 
-    // Posix warm latency (page cache hot)
+    // Posix warm latency — single-thread QD=1 for per-op measurement
     BandwidthResult posix_wlat, posix_rlat;
     {
         int fd = open(FLAGS_posix_path.c_str(), OpenPosixFlags(false), 0644);
-        PosixFile pf(FLAGS_posix_path, fd);
-        posix_wlat = BenchFileRand(pf, 4096, file_size, kLatencyOps, true);
-        posix_rlat = BenchFileRand(pf, 4096, file_size, kLatencyOps, false);
+        if (fd >= 0) {
+            posix_wlat = BenchFileRandMT(fd, 4096, file_size, kLatencyOps,
+                                         true, 1);
+            posix_rlat = BenchFileRandMT(fd, 4096, file_size, kLatencyOps,
+                                         false, 1);
+            close(fd);
+        }
     }
 
-    // Posix cold latency (drop cache, measure from disk)
+    // Posix cold latency — single-thread QD=1
     BandwidthResult posix_cold_wlat, posix_cold_rlat;
     if (on_real_disk) {
         DropPageCache();
         int fd = open(FLAGS_posix_path.c_str(), OpenPosixFlags(false), 0644);
         if (fd >= 0) {
-            PosixFile pf(FLAGS_posix_path, fd);
-            posix_cold_wlat =
-                BenchFileRand(pf, 4096, file_size, kLatencyOps, true);
+            posix_cold_wlat = BenchFileRandMT(fd, 4096, file_size,
+                                              kLatencyOps, true, 1);
             DropPageCache();
-            posix_cold_rlat =
-                BenchFileRand(pf, 4096, file_size, kLatencyOps, false);
+            posix_cold_rlat = BenchFileRandMT(fd, 4096, file_size,
+                                              kLatencyOps, false, 1);
+            close(fd);
         }
     }
     unlink(FLAGS_posix_path.c_str());
