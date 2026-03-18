@@ -782,9 +782,10 @@ static void RunFileSeqBench() {
     PrintSeparator();
 
     std::vector<size_t> chunk_sizes = {
-        4096,          64 * 1024,  256 * 1024,  1024 * 1024,
-        4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024,
-        32 * 1024 * 1024, 64 * 1024 * 1024};
+        4096,               64 * 1024,          256 * 1024,
+        1024 * 1024,        4ULL * 1024 * 1024, 8ULL * 1024 * 1024,
+        16ULL * 1024 * 1024, 32ULL * 1024 * 1024, 64ULL * 1024 * 1024,
+        128ULL * 1024 * 1024, 256ULL * 1024 * 1024, 512ULL * 1024 * 1024};
 
     uint64_t bdev_size = env.GetBdevSize();
     size_t total_data = bdev_size / 2;
@@ -1154,7 +1155,7 @@ static void RunBackendBench() {
     // Multi-value-size sweep
     std::cout << "\n";
     PrintSeparator();
-    std::cout << "  VALUE SIZE SWEEP  (SPDK=" << spdk_mode
+    std::cout << "  BACKEND THROUGHPUT BY VALUE SIZE  (SPDK=" << spdk_mode
               << ", max_keys=" << num_keys
               << ", threads=" << threads
               << ", bdev=" << FormatSize(env.GetBdevSize())
@@ -1194,10 +1195,19 @@ static void RunBackendBench() {
         uint64_t bdev_cap = env.GetBdevSize();
         size_t per_key_overhead = vsz + 4096 + 64;
         size_t effective_keys = num_keys;
+
+        // Cap by bdev capacity
         if (per_key_overhead > 0) {
             size_t max_keys = bdev_cap / per_key_overhead / 2;
             if (max_keys < 4) max_keys = 4;
-            effective_keys = std::min(num_keys, max_keys);
+            effective_keys = std::min(effective_keys, max_keys);
+        }
+
+        // Cap total data per test to ~1GB for fast sweep
+        constexpr size_t kMaxTotalData = 1ULL * 1024 * 1024 * 1024;
+        if (vsz > 0) {
+            size_t max_by_data = std::max<size_t>(4, kMaxTotalData / vsz);
+            effective_keys = std::min(effective_keys, max_by_data);
         }
 
         double posix_ob = 0, posix_lb = 0;
