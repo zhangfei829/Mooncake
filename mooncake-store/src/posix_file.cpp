@@ -107,12 +107,51 @@ tl::expected<size_t, ErrorCode> PosixFile::vector_write(const iovec *iov,
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
 
-    ssize_t ret = ::pwritev(fd_, iov, iovcnt, offset);
-    if (ret < 0) {
-        return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+    static constexpr size_t kMaxPwritev = 4ULL * 1024 * 1024;
+
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i)
+        total += iov[i].iov_len;
+
+    if (total <= kMaxPwritev) {
+        ssize_t ret = ::pwritev(fd_, iov, iovcnt, offset);
+        if (ret < 0)
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+        return static_cast<size_t>(ret);
     }
 
-    return ret;
+    // Split large scatter-gather writes into <=4 MB sub-calls to avoid
+    // kernel dirty-page throttling (balance_dirty_pages_ratelimited).
+    size_t written = 0;
+    int cur = 0;
+    size_t cur_off = 0;
+
+    while (written < total) {
+        iovec sub[32];
+        int sub_cnt = 0;
+        size_t chunk_left = std::min(kMaxPwritev, total - written);
+
+        while (chunk_left > 0 && cur < iovcnt) {
+            size_t avail = iov[cur].iov_len - cur_off;
+            size_t take = std::min(chunk_left, avail);
+            sub[sub_cnt++] = {static_cast<char *>(iov[cur].iov_base) + cur_off,
+                              take};
+            chunk_left -= take;
+            cur_off += take;
+            if (cur_off >= iov[cur].iov_len) {
+                ++cur;
+                cur_off = 0;
+            }
+        }
+
+        ssize_t ret = ::pwritev(fd_, sub, sub_cnt,
+                                offset + static_cast<off_t>(written));
+        if (ret < 0)
+            return make_error<size_t>(ErrorCode::FILE_WRITE_FAIL);
+        written += static_cast<size_t>(ret);
+    }
+
+    return written;
 }
 
 tl::expected<size_t, ErrorCode> PosixFile::vector_read(const iovec *iov,
