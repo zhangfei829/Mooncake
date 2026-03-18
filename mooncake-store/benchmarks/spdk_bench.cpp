@@ -536,6 +536,13 @@ static BandwidthResult BenchSpdkSeqAsyncMT(size_t chunk_size,
         per_thread = chunk_size;
     }
 
+    size_t aligned_chunk = spdk_align_up(chunk_size);
+    constexpr size_t kTotalDmaBudget = 256ULL * 1024 * 1024;
+    size_t dma_per_thread = kTotalDmaBudget / static_cast<size_t>(nthreads);
+    int max_qd_dma = std::max(2,
+        static_cast<int>(dma_per_thread / aligned_chunk));
+    int per_thread_qd = std::min(std::max(2, iodepth / nthreads), max_qd_dma);
+
     std::vector<BandwidthResult> results(nthreads);
     auto wall_t0 = Clock::now();
     {
@@ -547,9 +554,10 @@ static BandwidthResult BenchSpdkSeqAsyncMT(size_t chunk_size,
                 ? (total_bytes - static_cast<size_t>(start)) : per_thread;
             pool.emplace_back(
                 [&results, chunk_size, start, bytes, is_write,
-                 do_verify, iodepth, t]() {
+                 do_verify, per_thread_qd, t]() {
                     results[t] = BenchSpdkSeqAsync(chunk_size, bytes, is_write,
-                                                   do_verify, iodepth, start);
+                                                   do_verify, per_thread_qd,
+                                                   start);
                 });
         }
         for (auto &th : pool) th.join();
@@ -689,6 +697,13 @@ static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
         return BenchSpdkRandAsync(io_size, file_size, num_ops, is_write,
                                   iodepth);
 
+    size_t aligned_io = spdk_align_up(io_size);
+    constexpr size_t kTotalDmaBudget = 256ULL * 1024 * 1024;
+    size_t dma_per_thread = kTotalDmaBudget / static_cast<size_t>(nthreads);
+    int max_qd_dma = std::max(2,
+        static_cast<int>(dma_per_thread / aligned_io));
+    int per_thread_qd = std::min(std::max(2, iodepth / nthreads), max_qd_dma);
+
     int ops_per_thread = num_ops / nthreads;
     std::vector<BandwidthResult> results(nthreads);
 
@@ -701,9 +716,10 @@ static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
             uint32_t seed = 12345 + static_cast<uint32_t>(t);
             pool.emplace_back(
                 [&results, io_size, file_size, ops, is_write,
-                 iodepth, seed, t]() {
+                 per_thread_qd, seed, t]() {
                     results[t] = BenchSpdkRandAsync(io_size, file_size, ops,
-                                                    is_write, iodepth, seed);
+                                                    is_write, per_thread_qd,
+                                                    seed);
                 });
         }
         for (auto &th : pool) th.join();
@@ -973,10 +989,11 @@ static void RunFileSeqBench() {
               << (on_real_disk ? ", cold=drop_caches" : "") << ")\n";
 
     std::vector<size_t> chunk_sizes = {
-        4096,               64 * 1024,          256 * 1024,
-        1024 * 1024,        4ULL * 1024 * 1024, 8ULL * 1024 * 1024,
-        16ULL * 1024 * 1024, 32ULL * 1024 * 1024, 64ULL * 1024 * 1024,
-        128ULL * 1024 * 1024, 256ULL * 1024 * 1024, 512ULL * 1024 * 1024};
+        4096,               32 * 1024,           128 * 1024,
+        512 * 1024,         1024 * 1024,         2ULL * 1024 * 1024,
+        8ULL * 1024 * 1024, 16ULL * 1024 * 1024, 32ULL * 1024 * 1024,
+        64ULL * 1024 * 1024, 128ULL * 1024 * 1024, 256ULL * 1024 * 1024,
+        512ULL * 1024 * 1024};
 
     uint64_t bdev_size = env.GetBdevSize();
     size_t default_total = 256ULL * 1024 * 1024;
@@ -1550,10 +1567,11 @@ static void RunBackendBench() {
     }
 
     std::vector<size_t> value_sizes = {
-        4096,              32 * 1024,        128 * 1024,
-        512 * 1024,        2ULL * 1024 * 1024,  8ULL * 1024 * 1024,
-        16ULL * 1024 * 1024, 32ULL * 1024 * 1024, 64ULL * 1024 * 1024,
-        128ULL * 1024 * 1024, 256ULL * 1024 * 1024, 512ULL * 1024 * 1024};
+        4096,              32 * 1024,           128 * 1024,
+        512 * 1024,        1024 * 1024,         2ULL * 1024 * 1024,
+        8ULL * 1024 * 1024, 16ULL * 1024 * 1024, 32ULL * 1024 * 1024,
+        64ULL * 1024 * 1024, 128ULL * 1024 * 1024, 256ULL * 1024 * 1024,
+        512ULL * 1024 * 1024};
 
     for (size_t vsz : value_sizes) {
         uint64_t bdev_cap = env.GetBdevSize();
