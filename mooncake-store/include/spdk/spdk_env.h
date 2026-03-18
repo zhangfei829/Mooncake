@@ -47,7 +47,7 @@ struct SpdkEnvConfig {
     // Chunked DMA+memcpy pipeline for large values.
     // pipeline_chunk_kb: double-buffer chunk size (KB). 0 = use default (4096).
     // pipeline_threshold_kb: minimum aligned size to enable pipeline (KB).
-    //   0 = use default (2×chunk, ensures at least 2 chunks for overlap).
+    //   0 = use default (4×chunk = 16MB, ensures ≥4 chunks to amortize startup).
     int pipeline_chunk_kb = 0;
     int pipeline_threshold_kb = 0;
 };
