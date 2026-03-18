@@ -1349,7 +1349,7 @@ static void RunFileSeqBench() {
         512ULL * 1024 * 1024};
 
     uint64_t bdev_size = env.GetBdevSize();
-    size_t default_total = 1ULL * 1024 * 1024 * 1024;
+    size_t default_total = 512ULL * 1024 * 1024;
     size_t total_data = std::min(static_cast<size_t>(bdev_size / 2),
                                  default_total);
 
@@ -1390,9 +1390,7 @@ static void RunFileSeqBench() {
     }
 
     for (size_t chunk : chunk_sizes) {
-        size_t min_for_threads = chunk * static_cast<size_t>(FLAGS_threads);
-        size_t effective_total = std::max({total_data, chunk * 2,
-                                           min_for_threads});
+        size_t effective_total = std::max(total_data, chunk * 2);
         if (effective_total > bdev_size / 2) {
             std::cout << std::setw(12) << FormatSize(chunk).c_str()
                       << "  │  (skipped — exceeds bdev capacity)\n";
