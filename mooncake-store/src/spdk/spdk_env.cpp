@@ -537,6 +537,24 @@ void SpdkEnv::SubmitIo(SpdkIoRequest *req) {
 }
 
 // ---------------------------------------------------------------------------
+// Reactor accessors (for direct I/O from bench / tests)
+// ---------------------------------------------------------------------------
+void *SpdkEnv::GetReactorChannel(int idx) const {
+    if (idx < 0 || idx >= num_reactors_) return nullptr;
+    return reactors_[idx].io_channel;
+}
+
+void *SpdkEnv::GetReactorThread(int idx) const {
+    if (idx < 0 || idx >= num_reactors_) return nullptr;
+    return reactors_[idx].spdk_thread;
+}
+
+void SpdkEnv::SendMsgToReactor(int idx, void (*fn)(void *), void *arg) {
+    if (idx < 0 || idx >= num_reactors_) return;
+    spdk_thread_send_msg(SPDK_THREAD(reactors_[idx].spdk_thread), fn, arg);
+}
+
+// ---------------------------------------------------------------------------
 // DMA buffer helpers
 // ---------------------------------------------------------------------------
 void *SpdkEnv::DmaMalloc(size_t size, size_t align) {

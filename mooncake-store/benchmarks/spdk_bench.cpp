@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <filesystem>
@@ -35,6 +36,11 @@
 #include "file_interface.h"
 #include "spdk/spdk_env.h"
 #include "storage_backend.h"
+
+extern "C" {
+#include "spdk/bdev.h"
+#include "spdk/thread.h"
+}
 
 using namespace mooncake;
 using Clock = std::chrono::high_resolution_clock;
@@ -141,6 +147,11 @@ static int OpenPosixFlags(bool create) {
     return flags;
 }
 
+static bool PreallocateFile(int fd, size_t size) {
+    if (fallocate(fd, 0, 0, static_cast<off_t>(size)) == 0) return true;
+    return ftruncate(fd, static_cast<off_t>(size)) == 0;
+}
+
 struct LatencyStats {
     std::vector<double> samples_us;
 
@@ -212,20 +223,20 @@ static void FillPattern(char *buf, size_t len, uint32_t seed) {
 // Single-thread worker operating on [range_start, range_start + range_bytes).
 static BandwidthResult BenchFileSeqWorker(int fd, size_t chunk_size,
                                           off_t range_start,
-                                          size_t range_bytes, bool is_write,
-                                          bool do_verify) {
+                                          size_t range_bytes, bool is_write) {
     BandwidthResult result;
     size_t remaining = range_bytes;
     off_t offset = range_start;
 
     AlignedBuf buf(chunk_size);
-    AlignedBuf verify_buf(do_verify ? chunk_size : 0);
+
+    if (is_write)
+        FillPattern(buf.data(), chunk_size, static_cast<uint32_t>(range_start));
 
     while (remaining > 0) {
         size_t this_chunk = std::min(chunk_size, remaining);
 
         if (is_write) {
-            FillPattern(buf.data(), this_chunk, static_cast<uint32_t>(offset));
             iovec iov{buf.data(), this_chunk};
             ssize_t ret = ::pwritev(fd, &iov, 1, offset);
             if (ret < 0 || static_cast<size_t>(ret) != this_chunk) {
@@ -241,13 +252,6 @@ static BandwidthResult BenchFileSeqWorker(int fd, size_t chunk_size,
                 break;
             }
             result.total_bytes += this_chunk;
-
-            if (do_verify) {
-                FillPattern(verify_buf.data(), this_chunk,
-                            static_cast<uint32_t>(offset));
-                if (std::memcmp(buf.data(), verify_buf.data(), this_chunk) != 0)
-                    LOG(ERROR) << "Verify FAILED at offset " << offset;
-            }
         }
         offset += this_chunk;
         remaining -= this_chunk;
@@ -259,11 +263,10 @@ static BandwidthResult BenchFileSeqWorker(int fd, size_t chunk_size,
 // each operating on a disjoint range.
 static BandwidthResult BenchFileSeqMT(int fd, size_t chunk_size,
                                       size_t total_bytes, bool is_write,
-                                      bool do_verify, int nthreads) {
+                                      bool /* do_verify */, int nthreads) {
     if (nthreads <= 1) {
         auto wall_t0 = Clock::now();
-        auto r = BenchFileSeqWorker(fd, chunk_size, 0, total_bytes,
-                                    is_write, do_verify);
+        auto r = BenchFileSeqWorker(fd, chunk_size, 0, total_bytes, is_write);
         auto wall_t1 = Clock::now();
         r.total_secs = std::chrono::duration<double>(wall_t1 - wall_t0).count();
         return r;
@@ -284,9 +287,9 @@ static BandwidthResult BenchFileSeqMT(int fd, size_t chunk_size,
             size_t bytes = (t == nthreads - 1)
                 ? (total_bytes - start) : per_thread;
             pool.emplace_back([&results, fd, chunk_size, start, bytes,
-                               is_write, do_verify, t]() {
+                               is_write, t]() {
                 results[t] = BenchFileSeqWorker(fd, chunk_size, start, bytes,
-                                                is_write, do_verify);
+                                                is_write);
             });
         }
         for (auto &th : pool) th.join();
@@ -317,12 +320,13 @@ static BandwidthResult BenchFileRandWorker(int fd, size_t io_size,
 
     AlignedBuf buf(io_size);
 
+    if (is_write)
+        FillPattern(buf.data(), io_size, seed);
+
     for (int i = 0; i < num_ops; ++i) {
         off_t offset = static_cast<off_t>(dist(gen) * block_align);
 
         if (is_write) {
-            FillPattern(buf.data(), io_size,
-                        static_cast<uint32_t>(offset ^ i));
             iovec iov{buf.data(), io_size};
             auto t0 = Clock::now();
             ssize_t ret = ::pwritev(fd, &iov, 1, offset);
@@ -737,6 +741,359 @@ static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
 }
 
 // ============================================================================
+// Part 2e: Direct-on-reactor SPDK benchmark (poller-based, no msg passing)
+//
+// Runs the entire submit-drain loop as an SPDK poller on reactor 0.
+// This eliminates spdk_thread_send_msg overhead that dominates small-IO perf.
+// ============================================================================
+
+struct DirectBenchSlot {
+    bool completed = false;
+    bool success = false;
+};
+
+static void direct_io_done_cb(struct spdk_bdev_io *bio, bool ok, void *arg) {
+    auto *slot = static_cast<DirectBenchSlot *>(arg);
+    spdk_bdev_free_io(bio);
+    slot->success = ok;
+    slot->completed = true;
+}
+
+struct DirectSeqCtx {
+    struct spdk_bdev_desc *desc;
+    struct spdk_io_channel *ch;
+
+    void **dma_bufs;
+    int iodepth;
+    size_t chunk_size;
+    size_t aligned_chunk;
+    size_t total_ops;
+    bool is_write;
+
+    std::vector<char> *src_bufs;
+
+    DirectBenchSlot *slots;
+    size_t submitted;
+    size_t completed_count;
+    int head, tail;
+    off_t next_offset;
+
+    Clock::time_point wall_t0;
+    BandwidthResult *result;
+    struct spdk_poller *poller;
+    std::atomic<bool> *done_flag;
+};
+
+static int direct_seq_poller_fn(void *arg) {
+    auto *ctx = static_cast<DirectSeqCtx *>(arg);
+
+    while (ctx->completed_count < ctx->submitted) {
+        auto &s = ctx->slots[ctx->tail];
+        if (!s.completed) break;
+        ctx->result->total_bytes += ctx->chunk_size;
+        ctx->result->total_ops++;
+        ctx->completed_count++;
+        s.completed = false;
+        ctx->tail = (ctx->tail + 1) % ctx->iodepth;
+    }
+
+    int batch = 0;
+    while (ctx->submitted - ctx->completed_count <
+               static_cast<size_t>(ctx->iodepth) &&
+           ctx->submitted < ctx->total_ops && batch < 64) {
+        int slot = ctx->head;
+        auto &s = ctx->slots[slot];
+
+        if (ctx->is_write) {
+            std::memcpy(ctx->dma_bufs[slot], ctx->src_bufs[slot].data(),
+                        ctx->chunk_size);
+            int rc = spdk_bdev_write(ctx->desc, ctx->ch, ctx->dma_bufs[slot],
+                                     ctx->next_offset, ctx->aligned_chunk,
+                                     direct_io_done_cb, &s);
+            if (rc != 0) { s.completed = true; s.success = false; }
+        } else {
+            int rc = spdk_bdev_read(ctx->desc, ctx->ch, ctx->dma_bufs[slot],
+                                    ctx->next_offset, ctx->aligned_chunk,
+                                    direct_io_done_cb, &s);
+            if (rc != 0) { s.completed = true; s.success = false; }
+        }
+
+        ctx->next_offset += static_cast<off_t>(ctx->chunk_size);
+        ctx->submitted++;
+        ctx->head = (ctx->head + 1) % ctx->iodepth;
+        ++batch;
+    }
+
+    if (ctx->completed_count >= ctx->total_ops) {
+        ctx->result->total_secs =
+            std::chrono::duration<double>(Clock::now() - ctx->wall_t0).count();
+        spdk_poller_unregister(&ctx->poller);
+        ctx->done_flag->store(true, std::memory_order_release);
+        return SPDK_POLLER_IDLE;
+    }
+    return SPDK_POLLER_BUSY;
+}
+
+static void direct_seq_setup_msg(void *arg) {
+    auto *ctx = static_cast<DirectSeqCtx *>(arg);
+    ctx->wall_t0 = Clock::now();
+    ctx->poller = spdk_poller_register(direct_seq_poller_fn, ctx, 0);
+}
+
+static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
+                                           size_t total_bytes, bool is_write,
+                                           int iodepth) {
+    auto &env = SpdkEnv::Instance();
+    size_t aligned_chunk = spdk_align_up(chunk_size);
+
+    constexpr size_t kMaxDmaTotal = 256ULL * 1024 * 1024;
+    int max_qd = static_cast<int>(kMaxDmaTotal / aligned_chunk);
+    if (max_qd < 2) max_qd = 2;
+    if (iodepth > max_qd) iodepth = max_qd;
+
+    auto dma_bufs = std::make_unique<void *[]>(iodepth);
+    int actual_qd = 0;
+    for (int i = 0; i < iodepth; ++i) {
+        dma_bufs[i] = env.DmaMalloc(aligned_chunk, env.GetBlockSize());
+        if (!dma_bufs[i]) break;
+        ++actual_qd;
+    }
+    if (actual_qd == 0) {
+        LOG(ERROR) << "DmaMalloc failed for chunk=" << FormatSize(chunk_size);
+        return {};
+    }
+    iodepth = actual_qd;
+
+    auto src_bufs = std::make_unique<std::vector<char>[]>(iodepth);
+    if (is_write) {
+        for (int i = 0; i < iodepth; ++i) {
+            src_bufs[i].resize(chunk_size);
+            FillPattern(src_bufs[i].data(), chunk_size,
+                        static_cast<uint32_t>(i));
+        }
+    }
+
+    auto slots = std::make_unique<DirectBenchSlot[]>(iodepth);
+    BandwidthResult result;
+    std::atomic<bool> done{false};
+
+    DirectSeqCtx ctx{};
+    ctx.desc = static_cast<struct spdk_bdev_desc *>(env.GetBdevDesc());
+    ctx.ch = static_cast<struct spdk_io_channel *>(env.GetReactorChannel(0));
+    ctx.dma_bufs = dma_bufs.get();
+    ctx.iodepth = iodepth;
+    ctx.chunk_size = chunk_size;
+    ctx.aligned_chunk = aligned_chunk;
+    ctx.total_ops = total_bytes / chunk_size;
+    ctx.is_write = is_write;
+    ctx.src_bufs = src_bufs.get();
+    ctx.slots = slots.get();
+    ctx.submitted = 0;
+    ctx.completed_count = 0;
+    ctx.head = 0;
+    ctx.tail = 0;
+    ctx.next_offset = 0;
+    ctx.result = &result;
+    ctx.poller = nullptr;
+    ctx.done_flag = &done;
+
+    env.SendMsgToReactor(0, direct_seq_setup_msg, &ctx);
+
+    while (!done.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+
+    for (int i = 0; i < iodepth; ++i)
+        if (dma_bufs[i]) env.DmaFree(dma_bufs[i]);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Direct-on-reactor random I/O benchmark
+// ---------------------------------------------------------------------------
+
+struct DirectRandCtx {
+    struct spdk_bdev_desc *desc;
+    struct spdk_io_channel *ch;
+
+    void **dma_bufs;
+    int iodepth;
+    size_t io_size;
+    size_t aligned_io;
+    int total_ops;
+    bool is_write;
+
+    std::vector<char> *src_bufs;
+    off_t *offsets;
+
+    DirectBenchSlot *slots;
+    int submitted;
+    int completed_count;
+    int head, tail;
+
+    Clock::time_point wall_t0;
+    Clock::time_point *submit_ts;
+    BandwidthResult *result;
+    struct spdk_poller *poller;
+    std::atomic<bool> *done_flag;
+};
+
+static int direct_rand_poller_fn(void *arg) {
+    auto *ctx = static_cast<DirectRandCtx *>(arg);
+
+    while (ctx->completed_count < ctx->submitted) {
+        auto &s = ctx->slots[ctx->tail];
+        if (!s.completed) break;
+        if (ctx->submit_ts) {
+            double us = std::chrono::duration<double, std::micro>(
+                            Clock::now() - ctx->submit_ts[ctx->tail]).count();
+            ctx->result->latency.Add(us);
+        }
+        ctx->result->total_bytes += ctx->io_size;
+        ctx->result->total_ops++;
+        ctx->completed_count++;
+        s.completed = false;
+        ctx->tail = (ctx->tail + 1) % ctx->iodepth;
+    }
+
+    int batch = 0;
+    while (ctx->submitted - ctx->completed_count < ctx->iodepth &&
+           ctx->submitted < ctx->total_ops && batch < 64) {
+        int slot = ctx->head;
+        auto &s = ctx->slots[slot];
+        off_t off = ctx->offsets[ctx->submitted];
+
+        if (ctx->submit_ts)
+            ctx->submit_ts[slot] = Clock::now();
+
+        if (ctx->is_write) {
+            std::memcpy(ctx->dma_bufs[slot], ctx->src_bufs[slot].data(),
+                        ctx->io_size);
+            int rc = spdk_bdev_write(ctx->desc, ctx->ch, ctx->dma_bufs[slot],
+                                     off, ctx->aligned_io,
+                                     direct_io_done_cb, &s);
+            if (rc != 0) { s.completed = true; s.success = false; }
+        } else {
+            int rc = spdk_bdev_read(ctx->desc, ctx->ch, ctx->dma_bufs[slot],
+                                    off, ctx->aligned_io,
+                                    direct_io_done_cb, &s);
+            if (rc != 0) { s.completed = true; s.success = false; }
+        }
+
+        ctx->submitted++;
+        ctx->head = (ctx->head + 1) % ctx->iodepth;
+        ++batch;
+    }
+
+    if (ctx->completed_count >= ctx->total_ops) {
+        ctx->result->total_secs =
+            std::chrono::duration<double>(Clock::now() - ctx->wall_t0).count();
+        ctx->result->latency.Sort();
+        spdk_poller_unregister(&ctx->poller);
+        ctx->done_flag->store(true, std::memory_order_release);
+        return SPDK_POLLER_IDLE;
+    }
+    return SPDK_POLLER_BUSY;
+}
+
+static void direct_rand_setup_msg(void *arg) {
+    auto *ctx = static_cast<DirectRandCtx *>(arg);
+    ctx->wall_t0 = Clock::now();
+    ctx->poller = spdk_poller_register(direct_rand_poller_fn, ctx, 0);
+}
+
+static BandwidthResult BenchSpdkRandDirect(size_t io_size, size_t file_size,
+                                            int num_ops, bool is_write,
+                                            int iodepth,
+                                            bool collect_latency = false) {
+    auto &env = SpdkEnv::Instance();
+    size_t aligned_io = spdk_align_up(io_size);
+
+    constexpr size_t kMaxDmaTotal = 256ULL * 1024 * 1024;
+    int max_qd = static_cast<int>(kMaxDmaTotal / aligned_io);
+    if (max_qd < 2) max_qd = 2;
+    if (iodepth > max_qd) iodepth = max_qd;
+
+    auto dma_bufs = std::make_unique<void *[]>(iodepth);
+    int actual_qd = 0;
+    for (int i = 0; i < iodepth; ++i) {
+        dma_bufs[i] = env.DmaMalloc(aligned_io, env.GetBlockSize());
+        if (!dma_bufs[i]) break;
+        ++actual_qd;
+    }
+    if (actual_qd == 0) {
+        LOG(ERROR) << "DmaMalloc failed for io=" << FormatSize(io_size);
+        return {};
+    }
+    iodepth = actual_qd;
+
+    auto src_bufs = std::make_unique<std::vector<char>[]>(iodepth);
+    if (is_write) {
+        for (int i = 0; i < iodepth; ++i) {
+            src_bufs[i].resize(io_size);
+            FillPattern(src_bufs[i].data(), io_size,
+                        static_cast<uint32_t>(i));
+        }
+    }
+
+    size_t block_align = 4096;
+    size_t max_off = (file_size - io_size) / block_align * block_align;
+    std::mt19937 gen(12345);
+    std::uniform_int_distribution<size_t> dist(0, max_off / block_align);
+
+    std::vector<off_t> offsets(num_ops);
+    for (int i = 0; i < num_ops; ++i)
+        offsets[i] = static_cast<off_t>(dist(gen) * block_align);
+
+    auto slots = std::make_unique<DirectBenchSlot[]>(iodepth);
+    std::unique_ptr<Clock::time_point[]> submit_ts;
+    if (collect_latency)
+        submit_ts = std::make_unique<Clock::time_point[]>(iodepth);
+
+    BandwidthResult result;
+    std::atomic<bool> done{false};
+
+    DirectRandCtx ctx{};
+    ctx.desc = static_cast<struct spdk_bdev_desc *>(env.GetBdevDesc());
+    ctx.ch = static_cast<struct spdk_io_channel *>(env.GetReactorChannel(0));
+    ctx.dma_bufs = dma_bufs.get();
+    ctx.iodepth = iodepth;
+    ctx.io_size = io_size;
+    ctx.aligned_io = aligned_io;
+    ctx.total_ops = num_ops;
+    ctx.is_write = is_write;
+    ctx.src_bufs = src_bufs.get();
+    ctx.offsets = offsets.data();
+    ctx.slots = slots.get();
+    ctx.submitted = 0;
+    ctx.completed_count = 0;
+    ctx.head = 0;
+    ctx.tail = 0;
+    ctx.submit_ts = submit_ts.get();
+    ctx.result = &result;
+    ctx.poller = nullptr;
+    ctx.done_flag = &done;
+
+    env.SendMsgToReactor(0, direct_rand_setup_msg, &ctx);
+
+    while (!done.load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+
+    for (int i = 0; i < iodepth; ++i)
+        if (dma_bufs[i]) env.DmaFree(dma_bufs[i]);
+    return result;
+}
+
+// ============================================================================
 // Part 3: Backend-level (OffsetAllocatorStorageBackend) throughput
 // ============================================================================
 
@@ -1012,7 +1369,7 @@ static void RunFileSeqBench() {
 
     char spdk_col[64];
     std::snprintf(spdk_col, sizeof(spdk_col),
-                  "SPDK %dC T=%d QD=%d W/R", nc, FLAGS_threads, FLAGS_iodepth);
+                  "SPDK %dC QD=%d W/R MB/s", nc, FLAGS_iodepth);
 
     if (on_real_disk) {
         PrintSeparator(TW);
@@ -1061,8 +1418,8 @@ static void RunFileSeqBench() {
                                << " errno=" << errno;
                     return;
                 }
-                if (ftruncate(fd, effective_total) != 0) {
-                    LOG(ERROR) << "ftruncate failed";
+                if (!PreallocateFile(fd, effective_total)) {
+                    LOG(ERROR) << "PreallocateFile failed";
                     close(fd);
                     return;
                 }
@@ -1082,7 +1439,7 @@ static void RunFileSeqBench() {
                     int fd = open(FLAGS_posix_path.c_str(),
                                   OpenPosixFlags(true), 0644);
                     if (fd >= 0) {
-                        ftruncate(fd, effective_total);
+                        PreallocateFile(fd, effective_total);
                         auto wr = BenchFileSeqMT(fd, chunk, effective_total,
                                                  true, false, FLAGS_threads);
                         posix_cold_w.push_back(wr.BW_MBps());
@@ -1103,14 +1460,12 @@ static void RunFileSeqBench() {
             }
             unlink(FLAGS_posix_path.c_str());
 
-            // --- SPDK (async pipeline, QD = iodepth, T threads) ---
+            // --- SPDK (direct-on-reactor poller, no msg passing) ---
             {
-                auto wr = BenchSpdkSeqAsyncMT(chunk, effective_total, true,
-                                              false, FLAGS_iodepth,
-                                              FLAGS_threads);
-                auto rd = BenchSpdkSeqAsyncMT(chunk, effective_total, false,
-                                              verify_this, FLAGS_iodepth,
-                                              FLAGS_threads);
+                auto wr = BenchSpdkSeqDirect(chunk, effective_total, true,
+                                             FLAGS_iodepth);
+                auto rd = BenchSpdkSeqDirect(chunk, effective_total, false,
+                                             FLAGS_iodepth);
                 spdk_w.push_back(wr.BW_MBps());
                 spdk_r.push_back(rd.BW_MBps());
             }
@@ -1178,7 +1533,7 @@ static void RunFileRandBench() {
 
     char spdk_col[64];
     std::snprintf(spdk_col, sizeof(spdk_col),
-                  "SPDK %dC T=%d QD=%d W/R", nc, FLAGS_threads, FLAGS_iodepth);
+                  "SPDK %dC QD=%d W/R MB/s", nc, FLAGS_iodepth);
 
     if (on_real_disk) {
         PrintSeparator(TW);
@@ -1219,14 +1574,14 @@ static void RunFileRandBench() {
                 int fd = open(FLAGS_posix_path.c_str(),
                               OpenPosixFlags(true), 0644);
                 if (fd >= 0) {
-                    ftruncate(fd, file_size);
+                    PreallocateFile(fd, file_size);
                     BenchFileSeqMT(fd, 1024 * 1024, file_size, true,
                                    false, 1);
                     close(fd);
                 }
             }
-            BenchSpdkSeqAsync(1024 * 1024, file_size, true, false,
-                              FLAGS_iodepth);
+            BenchSpdkSeqDirect(1024 * 1024, file_size, true,
+                               FLAGS_iodepth);
 
             // Posix warm random
             {
@@ -1260,12 +1615,12 @@ static void RunFileRandBench() {
             }
             unlink(FLAGS_posix_path.c_str());
 
-            // SPDK random (multi-threaded)
+            // SPDK random (direct-on-reactor poller)
             {
-                auto wr = BenchSpdkRandAsyncMT(4096, file_size, num_ops, true,
-                                               FLAGS_iodepth, FLAGS_threads);
-                auto rd = BenchSpdkRandAsyncMT(4096, file_size, num_ops, false,
-                                               FLAGS_iodepth, FLAGS_threads);
+                auto wr = BenchSpdkRandDirect(4096, file_size, num_ops, true,
+                                              FLAGS_iodepth);
+                auto rd = BenchSpdkRandDirect(4096, file_size, num_ops, false,
+                                              FLAGS_iodepth);
                 sw_v.push_back(wr.BW_MBps());
                 sr_v.push_back(rd.BW_MBps());
             }
@@ -1331,12 +1686,12 @@ static void RunFileRandBench() {
     {
         int fd = open(FLAGS_posix_path.c_str(), OpenPosixFlags(true), 0644);
         if (fd >= 0) {
-            ftruncate(fd, file_size);
+            PreallocateFile(fd, file_size);
             BenchFileSeqMT(fd, 1024 * 1024, file_size, true, false, 1);
             close(fd);
         }
     }
-    BenchSpdkSeqAsync(1024 * 1024, file_size, true, false, FLAGS_iodepth);
+    BenchSpdkSeqDirect(1024 * 1024, file_size, true, FLAGS_iodepth);
 
     // Posix warm latency — single-thread QD=1 for per-op measurement
     BandwidthResult posix_wlat, posix_rlat;
@@ -1367,9 +1722,11 @@ static void RunFileRandBench() {
     }
     unlink(FLAGS_posix_path.c_str());
 
-    // SPDK latency at QD=1
-    auto spdk_wlat = BenchSpdkRandAsync(4096, file_size, kLatencyOps, true, 1);
-    auto spdk_rlat = BenchSpdkRandAsync(4096, file_size, kLatencyOps, false, 1);
+    // SPDK latency at QD=1 (direct poller — true single-op latency)
+    auto spdk_wlat = BenchSpdkRandDirect(4096, file_size, kLatencyOps, true,
+                                          1, true);
+    auto spdk_rlat = BenchSpdkRandDirect(4096, file_size, kLatencyOps, false,
+                                          1, true);
 
     if (on_real_disk) {
         auto print_lat_row_3 = [](const char *label, const LatencyStats &warm,

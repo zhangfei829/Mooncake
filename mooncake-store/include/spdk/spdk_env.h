@@ -107,6 +107,11 @@ class SpdkEnv {
     size_t GetPipelineThreshold() const;
     static void SetPipelineParams(size_t threshold, size_t chunk);
 
+    void *GetBdevDesc() const { return bdev_desc_; }
+    void *GetReactorChannel(int idx) const;
+    void *GetReactorThread(int idx) const;
+    void SendMsgToReactor(int idx, void (*fn)(void *), void *arg);
+
     void *DmaMalloc(size_t size, size_t align = 4096);
     void DmaFree(void *buf);
 
