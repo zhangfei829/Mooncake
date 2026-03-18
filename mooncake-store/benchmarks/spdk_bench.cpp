@@ -797,10 +797,9 @@ static int direct_seq_poller_fn(void *arg) {
         ctx->tail = (ctx->tail + 1) % ctx->iodepth;
     }
 
-    int batch = 0;
     while (ctx->submitted - ctx->completed_count <
                static_cast<size_t>(ctx->iodepth) &&
-           ctx->submitted < ctx->total_ops && batch < 64) {
+           ctx->submitted < ctx->total_ops) {
         int slot = ctx->head;
         auto &s = ctx->slots[slot];
 
@@ -821,7 +820,6 @@ static int direct_seq_poller_fn(void *arg) {
         ctx->next_offset += static_cast<off_t>(ctx->chunk_size);
         ctx->submitted++;
         ctx->head = (ctx->head + 1) % ctx->iodepth;
-        ++batch;
     }
 
     if (ctx->completed_count >= ctx->total_ops) {
@@ -960,9 +958,8 @@ static int direct_rand_poller_fn(void *arg) {
         ctx->tail = (ctx->tail + 1) % ctx->iodepth;
     }
 
-    int batch = 0;
     while (ctx->submitted - ctx->completed_count < ctx->iodepth &&
-           ctx->submitted < ctx->total_ops && batch < 64) {
+           ctx->submitted < ctx->total_ops) {
         int slot = ctx->head;
         auto &s = ctx->slots[slot];
         off_t off = ctx->offsets[ctx->submitted];
@@ -986,7 +983,6 @@ static int direct_rand_poller_fn(void *arg) {
 
         ctx->submitted++;
         ctx->head = (ctx->head + 1) % ctx->iodepth;
-        ++batch;
     }
 
     if (ctx->completed_count >= ctx->total_ops) {
@@ -1353,8 +1349,9 @@ static void RunFileSeqBench() {
         512ULL * 1024 * 1024};
 
     uint64_t bdev_size = env.GetBdevSize();
-    size_t default_total = 256ULL * 1024 * 1024;
-    size_t total_data = std::min(bdev_size / 2, default_total);
+    size_t default_total = 1ULL * 1024 * 1024 * 1024;
+    size_t total_data = std::min(static_cast<size_t>(bdev_size / 2),
+                                 default_total);
 
     int nc = env.GetNumReactors();
 
@@ -1406,59 +1403,49 @@ static void RunFileSeqBench() {
         std::vector<double> posix_cold_w, posix_cold_r;
         std::vector<double> spdk_w, spdk_r;
 
+        // Create + preallocate file ONCE per chunk size (like VALUE bench).
+        // Avoids per-iteration ext4 extent allocation + journal overhead.
+        int warm_fd = open(FLAGS_posix_path.c_str(),
+                           OpenPosixFlags(true), 0644);
+        if (warm_fd < 0) {
+            LOG(ERROR) << "Cannot open " << FLAGS_posix_path
+                       << " errno=" << errno;
+            return;
+        }
+        if (!PreallocateFile(warm_fd, effective_total)) {
+            LOG(ERROR) << "PreallocateFile failed";
+            close(warm_fd);
+            return;
+        }
+
         for (int iter = 0; iter < FLAGS_iterations; ++iter) {
             bool verify_this = FLAGS_verify && (iter == 0);
 
             // --- Posix warm (write then read — page cache hot) ---
             {
-                int fd = open(FLAGS_posix_path.c_str(),
-                              OpenPosixFlags(true), 0644);
-                if (fd < 0) {
-                    LOG(ERROR) << "Cannot open " << FLAGS_posix_path
-                               << " errno=" << errno;
-                    return;
-                }
-                if (!PreallocateFile(fd, effective_total)) {
-                    LOG(ERROR) << "PreallocateFile failed";
-                    close(fd);
-                    return;
-                }
-                auto wr = BenchFileSeqMT(fd, chunk, effective_total, true,
+                auto wr = BenchFileSeqMT(warm_fd, chunk, effective_total, true,
                                          false, FLAGS_threads);
-                auto rd = BenchFileSeqMT(fd, chunk, effective_total, false,
+                auto rd = BenchFileSeqMT(warm_fd, chunk, effective_total, false,
                                          verify_this, FLAGS_threads);
                 posix_w.push_back(wr.BW_MBps());
                 posix_r.push_back(rd.BW_MBps());
-                close(fd);
             }
 
             // --- Posix cold (drop cache, then write + read from disk) ---
             if (on_real_disk) {
                 DropPageCache();
                 {
-                    int fd = open(FLAGS_posix_path.c_str(),
-                                  OpenPosixFlags(true), 0644);
-                    if (fd >= 0) {
-                        PreallocateFile(fd, effective_total);
-                        auto wr = BenchFileSeqMT(fd, chunk, effective_total,
-                                                 true, false, FLAGS_threads);
-                        posix_cold_w.push_back(wr.BW_MBps());
-                        close(fd);
-                    }
+                    auto wr = BenchFileSeqMT(warm_fd, chunk, effective_total,
+                                             true, false, FLAGS_threads);
+                    posix_cold_w.push_back(wr.BW_MBps());
                 }
                 DropPageCache();
                 {
-                    int fd = open(FLAGS_posix_path.c_str(),
-                                  OpenPosixFlags(false), 0644);
-                    if (fd >= 0) {
-                        auto rd = BenchFileSeqMT(fd, chunk, effective_total,
-                                                 false, false, FLAGS_threads);
-                        posix_cold_r.push_back(rd.BW_MBps());
-                        close(fd);
-                    }
+                    auto rd = BenchFileSeqMT(warm_fd, chunk, effective_total,
+                                             false, false, FLAGS_threads);
+                    posix_cold_r.push_back(rd.BW_MBps());
                 }
             }
-            unlink(FLAGS_posix_path.c_str());
 
             // --- SPDK (direct-on-reactor poller, no msg passing) ---
             {
@@ -1470,6 +1457,8 @@ static void RunFileSeqBench() {
                 spdk_r.push_back(rd.BW_MBps());
             }
         }
+        close(warm_fd);
+        unlink(FLAGS_posix_path.c_str());
 
         double pw = trimmed_mean(posix_w), pr = trimmed_mean(posix_r);
         double pcw = posix_cold_w.empty() ? 0 : trimmed_mean(posix_cold_w);
