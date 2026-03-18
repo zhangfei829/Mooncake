@@ -259,7 +259,13 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
                                     block_size_);
     if (got == 0) {
+        LOG(ERROR) << "SpdkFile: write_batch DMA alloc got 0 buffers"
+                   << " (requested=" << qd << " × " << max_aligned << ")";
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (got < qd) {
+        LOG(WARNING) << "SpdkFile: write_batch DMA alloc partial "
+                     << got << "/" << qd << " × " << max_aligned;
     }
     qd = got;
 
@@ -359,7 +365,13 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
                                     block_size_);
     if (got == 0) {
+        LOG(ERROR) << "SpdkFile: read_batch DMA alloc got 0 buffers"
+                   << " (requested=" << qd << " × " << max_aligned << ")";
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (got < qd) {
+        LOG(WARNING) << "SpdkFile: read_batch DMA alloc partial "
+                     << got << "/" << qd << " × " << max_aligned;
     }
     qd = got;
 
@@ -369,6 +381,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
     int submitted = 0, completed = 0;
     int head = 0, tail = 0;
     ErrorCode first_err = ErrorCode::OK;
+    int fail_idx = -1;
 
     while (completed < count) {
         int batch_count = 0;
@@ -408,8 +421,10 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         while (completed < submitted) {
             if (!reqs[tail].completed.load(std::memory_order_acquire))
                 break;
-            if (!reqs[tail].success && first_err == ErrorCode::OK)
+            if (!reqs[tail].success && first_err == ErrorCode::OK) {
                 first_err = ErrorCode::FILE_READ_FAIL;
+                fail_idx = completed;
+            }
             completed++;
             tail = (tail + 1) % qd;
         }
@@ -417,8 +432,12 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
 
     env.DmaPoolFreeBatch(dma_bufs.get(), max_aligned, qd);
 
-    if (first_err != ErrorCode::OK)
+    if (first_err != ErrorCode::OK) {
+        LOG(ERROR) << "SpdkFile: read_batch I/O failed at entry " << fail_idx
+                   << "/" << count << " (qd=" << qd
+                   << ", buf=" << max_aligned << ")";
         return tl::make_unexpected(first_err);
+    }
     return {};
 }
 
