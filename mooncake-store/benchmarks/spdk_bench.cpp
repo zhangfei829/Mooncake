@@ -1062,11 +1062,15 @@ static void RunBackendBench() {
     int threads = FLAGS_threads;
     int iters = FLAGS_iterations;
 
-    // Pre-warm DMA pool with pipeline-depth buffers
+    // Pre-warm DMA pool with pipeline-depth buffers, capped by hugepage budget
     {
-        constexpr int kPipelineQD = 128;
         size_t warm_size = spdk_align_up(value_size + 4096 + 64);
-        env.DmaPoolPrewarm(warm_size, kPipelineQD, env.GetBlockSize());
+        constexpr size_t kDmaBudget = 512ULL * 1024 * 1024;
+        int max_qd = warm_size > 0
+            ? std::max(4, static_cast<int>(kDmaBudget / warm_size))
+            : 128;
+        int qd = std::min(128, max_qd);
+        env.DmaPoolPrewarm(warm_size, qd, env.GetBlockSize());
     }
 
     // Header
@@ -1236,8 +1240,15 @@ static void RunBackendBench() {
         }
 
         // Pre-warm DMA pool for this specific value size.
-        int sweep_qd = std::min(static_cast<int>(effective_keys), 128);
+        // Cap pipeline depth so total DMA allocation stays within hugepage
+        // budget (~512MB safe limit for DMA buffers on small-memory machines).
         size_t warm_size = spdk_align_up(vsz + 4096 + 64);
+        constexpr size_t kDmaBudget = 512ULL * 1024 * 1024;
+        int max_qd_by_mem = warm_size > 0
+            ? std::max(4, static_cast<int>(kDmaBudget / warm_size))
+            : 128;
+        int sweep_qd = std::min({static_cast<int>(effective_keys), 128,
+                                 max_qd_by_mem});
         env.DmaPoolDrain();
         env.DmaPoolPrewarm(warm_size, sweep_qd, env.GetBlockSize());
 
