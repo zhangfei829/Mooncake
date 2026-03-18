@@ -269,8 +269,11 @@ static BandwidthResult BenchFileSeqMT(int fd, size_t chunk_size,
         return r;
     }
 
-    // Align per-thread range to chunk_size boundary
     size_t per_thread = (total_bytes / nthreads / chunk_size) * chunk_size;
+    if (per_thread < chunk_size) {
+        nthreads = std::max(1, static_cast<int>(total_bytes / chunk_size));
+        per_thread = chunk_size;
+    }
     std::vector<BandwidthResult> results(nthreads);
 
     auto wall_t0 = Clock::now();
@@ -400,7 +403,8 @@ static size_t spdk_align_up(size_t v) {
 
 static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
                                          size_t total_bytes, bool is_write,
-                                         bool do_verify, int iodepth) {
+                                         bool do_verify, int iodepth,
+                                         off_t base_offset = 0) {
     auto &env = SpdkEnv::Instance();
     size_t aligned_chunk = spdk_align_up(chunk_size);
 
@@ -441,7 +445,7 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
     size_t total_ops = total_bytes / chunk_size;
     size_t submitted = 0, completed = 0;
     int head = 0, tail = 0;
-    off_t submit_offset = 0;
+    off_t submit_offset = base_offset;
 
     std::vector<char> verify_buf;
     if (do_verify) verify_buf.resize(chunk_size);
@@ -518,13 +522,55 @@ static BandwidthResult BenchSpdkSeqAsync(size_t chunk_size,
     return result;
 }
 
+static BandwidthResult BenchSpdkSeqAsyncMT(size_t chunk_size,
+                                            size_t total_bytes, bool is_write,
+                                            bool do_verify, int iodepth,
+                                            int nthreads) {
+    if (nthreads <= 1)
+        return BenchSpdkSeqAsync(chunk_size, total_bytes, is_write,
+                                 do_verify, iodepth);
+
+    size_t per_thread = (total_bytes / nthreads / chunk_size) * chunk_size;
+    if (per_thread < chunk_size) {
+        nthreads = std::max(1, static_cast<int>(total_bytes / chunk_size));
+        per_thread = chunk_size;
+    }
+
+    std::vector<BandwidthResult> results(nthreads);
+    auto wall_t0 = Clock::now();
+    {
+        std::vector<std::thread> pool;
+        for (int t = 0; t < nthreads; ++t) {
+            off_t start =
+                static_cast<off_t>(t) * static_cast<off_t>(per_thread);
+            size_t bytes = (t == nthreads - 1)
+                ? (total_bytes - static_cast<size_t>(start)) : per_thread;
+            pool.emplace_back(
+                [&results, chunk_size, start, bytes, is_write,
+                 do_verify, iodepth, t]() {
+                    results[t] = BenchSpdkSeqAsync(chunk_size, bytes, is_write,
+                                                   do_verify, iodepth, start);
+                });
+        }
+        for (auto &th : pool) th.join();
+    }
+    auto wall_t1 = Clock::now();
+
+    BandwidthResult merged;
+    merged.total_secs =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
+    for (auto &r : results) merged.total_bytes += r.total_bytes;
+    return merged;
+}
+
 // ============================================================================
 // Part 2c: SPDK async random I/O (iodepth > 1)
 // ============================================================================
 
 static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
                                           int num_ops, bool is_write,
-                                          int iodepth) {
+                                          int iodepth,
+                                          uint32_t seed = 12345) {
     auto &env = SpdkEnv::Instance();
     size_t aligned_io = spdk_align_up(io_size);
 
@@ -563,7 +609,7 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
 
     size_t block_align = 4096;
     size_t max_off = (file_size - io_size) / block_align * block_align;
-    std::mt19937 gen(12345);
+    std::mt19937 gen(seed);
     std::uniform_int_distribution<size_t> dist(0, max_off / block_align);
 
     std::vector<off_t> offsets(num_ops);
@@ -634,6 +680,44 @@ static BandwidthResult BenchSpdkRandAsync(size_t io_size, size_t file_size,
     for (int i = 0; i < iodepth; ++i)
         if (dma_bufs[i]) env.DmaFree(dma_bufs[i]);
     return result;
+}
+
+static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
+                                            int num_ops, bool is_write,
+                                            int iodepth, int nthreads) {
+    if (nthreads <= 1)
+        return BenchSpdkRandAsync(io_size, file_size, num_ops, is_write,
+                                  iodepth);
+
+    int ops_per_thread = num_ops / nthreads;
+    std::vector<BandwidthResult> results(nthreads);
+
+    auto wall_t0 = Clock::now();
+    {
+        std::vector<std::thread> pool;
+        for (int t = 0; t < nthreads; ++t) {
+            int ops = (t == nthreads - 1)
+                ? (num_ops - ops_per_thread * t) : ops_per_thread;
+            uint32_t seed = 12345 + static_cast<uint32_t>(t);
+            pool.emplace_back(
+                [&results, io_size, file_size, ops, is_write,
+                 iodepth, seed, t]() {
+                    results[t] = BenchSpdkRandAsync(io_size, file_size, ops,
+                                                    is_write, iodepth, seed);
+                });
+        }
+        for (auto &th : pool) th.join();
+    }
+    auto wall_t1 = Clock::now();
+
+    BandwidthResult merged;
+    merged.total_secs =
+        std::chrono::duration<double>(wall_t1 - wall_t0).count();
+    for (auto &r : results) {
+        merged.total_bytes += r.total_bytes;
+        merged.total_ops += r.total_ops;
+    }
+    return merged;
 }
 
 // ============================================================================
@@ -911,7 +995,7 @@ static void RunFileSeqBench() {
 
     char spdk_col[64];
     std::snprintf(spdk_col, sizeof(spdk_col),
-                  "SPDK %dC QD=%d W/R MB/s", nc, FLAGS_iodepth);
+                  "SPDK %dC T=%d QD=%d W/R", nc, FLAGS_threads, FLAGS_iodepth);
 
     if (on_real_disk) {
         PrintSeparator(TW);
@@ -935,7 +1019,9 @@ static void RunFileSeqBench() {
     }
 
     for (size_t chunk : chunk_sizes) {
-        size_t effective_total = std::max(total_data, chunk * 2);
+        size_t min_for_threads = chunk * static_cast<size_t>(FLAGS_threads);
+        size_t effective_total = std::max({total_data, chunk * 2,
+                                           min_for_threads});
         if (effective_total > bdev_size / 2) {
             std::cout << std::setw(12) << FormatSize(chunk).c_str()
                       << "  │  (skipped — exceeds bdev capacity)\n";
@@ -1000,12 +1086,14 @@ static void RunFileSeqBench() {
             }
             unlink(FLAGS_posix_path.c_str());
 
-            // --- SPDK (async pipeline, QD = iodepth) ---
+            // --- SPDK (async pipeline, QD = iodepth, T threads) ---
             {
-                auto wr = BenchSpdkSeqAsync(chunk, effective_total, true,
-                                            false, FLAGS_iodepth);
-                auto rd = BenchSpdkSeqAsync(chunk, effective_total, false,
-                                            verify_this, FLAGS_iodepth);
+                auto wr = BenchSpdkSeqAsyncMT(chunk, effective_total, true,
+                                              false, FLAGS_iodepth,
+                                              FLAGS_threads);
+                auto rd = BenchSpdkSeqAsyncMT(chunk, effective_total, false,
+                                              verify_this, FLAGS_iodepth,
+                                              FLAGS_threads);
                 spdk_w.push_back(wr.BW_MBps());
                 spdk_r.push_back(rd.BW_MBps());
             }
@@ -1073,7 +1161,7 @@ static void RunFileRandBench() {
 
     char spdk_col[64];
     std::snprintf(spdk_col, sizeof(spdk_col),
-                  "SPDK %dC QD=%d W/R MB/s", nc, FLAGS_iodepth);
+                  "SPDK %dC T=%d QD=%d W/R", nc, FLAGS_threads, FLAGS_iodepth);
 
     if (on_real_disk) {
         PrintSeparator(TW);
@@ -1155,12 +1243,12 @@ static void RunFileRandBench() {
             }
             unlink(FLAGS_posix_path.c_str());
 
-            // SPDK random
+            // SPDK random (multi-threaded)
             {
-                auto wr = BenchSpdkRandAsync(4096, file_size, num_ops, true,
-                                             FLAGS_iodepth);
-                auto rd = BenchSpdkRandAsync(4096, file_size, num_ops, false,
-                                             FLAGS_iodepth);
+                auto wr = BenchSpdkRandAsyncMT(4096, file_size, num_ops, true,
+                                               FLAGS_iodepth, FLAGS_threads);
+                auto rd = BenchSpdkRandAsyncMT(4096, file_size, num_ops, false,
+                                               FLAGS_iodepth, FLAGS_threads);
                 sw_v.push_back(wr.BW_MBps());
                 sr_v.push_back(rd.BW_MBps());
             }
