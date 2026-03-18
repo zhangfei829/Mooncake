@@ -562,8 +562,13 @@ void SpdkEnv::DmaPoolFree(void *buf, size_t size) {
 int SpdkEnv::DmaPoolAllocBatch(void **out_bufs, size_t needed, int count,
                                 size_t align) {
     int got = 0;
+    int pool_total = 0, pool_match = 0;
     {
         std::lock_guard<std::mutex> lk(dma_pool_mutex_);
+        pool_total = static_cast<int>(dma_pool_.size());
+        for (int j = 0; j < pool_total; ++j)
+            if (dma_pool_[j].size >= needed) ++pool_match;
+
         for (int i = static_cast<int>(dma_pool_.size()) - 1;
              i >= 0 && got < count; --i) {
             if (dma_pool_[i].size >= needed) {
@@ -573,9 +578,20 @@ int SpdkEnv::DmaPoolAllocBatch(void **out_bufs, size_t needed, int count,
             }
         }
     }
+    int from_pool = got;
     for (int i = got; i < count; ++i) {
         out_bufs[i] = spdk_dma_malloc(needed, align, nullptr);
-        if (!out_bufs[i]) return i;
+        if (!out_bufs[i]) {
+            if (got < count) {
+                LOG(WARNING) << "DmaPoolAllocBatch: pool=" << pool_total
+                             << " match=" << pool_match
+                             << " from_pool=" << from_pool
+                             << " malloc_fail_at=" << i
+                             << " needed=" << needed
+                             << " requested=" << count;
+            }
+            return i;
+        }
         ++got;
     }
     return got;
