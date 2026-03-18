@@ -221,56 +221,46 @@ static void FillPattern(char *buf, size_t len, uint32_t seed) {
 // ============================================================================
 
 // Single-thread worker operating on [range_start, range_start + range_bytes).
-// Writes larger than kMaxSyscallWrite are split into sub-chunks to avoid
-// Linux dirty-page throttling (balance_dirty_pages_ratelimited stalls on
-// single massive pwritev calls).  Reads are issued as-is.
+// I/O buffer is capped at kMaxIoPiece (4 MB) regardless of chunk_size.
+// For large chunks the logical chunk is issued as multiple kMaxIoPiece
+// pwritev/preadv calls, avoiding both dirty-page throttling and the
+// massive page-fault overhead of allocating chunk_size user buffers
+// (128 MB chunk × 4 threads = 512 MB → ~130 K page faults ≈ 150 ms).
 static BandwidthResult BenchFileSeqWorker(int fd, size_t chunk_size,
                                           off_t range_start,
                                           size_t range_bytes, bool is_write) {
-    static constexpr size_t kMaxSyscallWrite = 4ULL * 1024 * 1024;
+    static constexpr size_t kMaxIoPiece = 4ULL * 1024 * 1024;
 
     BandwidthResult result;
     size_t remaining = range_bytes;
     off_t offset = range_start;
 
-    AlignedBuf buf(chunk_size);
+    const size_t buf_size = std::min(chunk_size, kMaxIoPiece);
+    AlignedBuf buf(buf_size);
 
     if (is_write)
-        FillPattern(buf.data(), chunk_size, static_cast<uint32_t>(range_start));
+        FillPattern(buf.data(), buf_size, static_cast<uint32_t>(range_start));
 
     while (remaining > 0) {
         size_t this_chunk = std::min(chunk_size, remaining);
 
-        if (is_write && this_chunk > kMaxSyscallWrite) {
-            size_t done = 0;
-            while (done < this_chunk) {
-                size_t piece = std::min(kMaxSyscallWrite, this_chunk - done);
-                iovec iov{buf.data() + done, piece};
-                ssize_t ret = ::pwritev(fd, &iov, 1, offset + done);
-                if (ret < 0 || static_cast<size_t>(ret) != piece) {
-                    LOG(ERROR) << "Write failed at offset " << offset + done;
-                    return result;
-                }
-                done += piece;
-            }
-            result.total_bytes += this_chunk;
-        } else if (is_write) {
-            iovec iov{buf.data(), this_chunk};
-            ssize_t ret = ::pwritev(fd, &iov, 1, offset);
-            if (ret < 0 || static_cast<size_t>(ret) != this_chunk) {
-                LOG(ERROR) << "Write failed at offset " << offset;
+        size_t done = 0;
+        while (done < this_chunk) {
+            size_t piece = std::min(buf_size, this_chunk - done);
+            iovec iov{buf.data(), piece};
+            ssize_t ret;
+            if (is_write)
+                ret = ::pwritev(fd, &iov, 1, offset + done);
+            else
+                ret = ::preadv(fd, &iov, 1, offset + done);
+            if (ret < 0 || static_cast<size_t>(ret) != piece) {
+                LOG(ERROR) << (is_write ? "Write" : "Read")
+                           << " failed at offset " << (offset + done);
                 return result;
             }
-            result.total_bytes += this_chunk;
-        } else {
-            iovec iov{buf.data(), this_chunk};
-            ssize_t ret = ::preadv(fd, &iov, 1, offset);
-            if (ret < 0 || static_cast<size_t>(ret) != this_chunk) {
-                LOG(ERROR) << "Read failed at offset " << offset;
-                return result;
-            }
-            result.total_bytes += this_chunk;
+            done += piece;
         }
+        result.total_bytes += this_chunk;
         offset += this_chunk;
         remaining -= this_chunk;
     }
