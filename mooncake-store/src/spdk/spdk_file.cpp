@@ -23,6 +23,15 @@ void SpdkEnv::SetPipelineParams(size_t threshold, size_t chunk) {
 size_t SpdkEnv::GetPipelineChunk() const { return g_pipeline_chunk; }
 size_t SpdkEnv::GetPipelineThreshold() const { return g_pipeline_threshold; }
 
+static ErrorCode ChunkedReadOne(SpdkEnv &env, uint64_t disk_offset,
+                                size_t aligned_len, size_t skip,
+                                const iovec *iov, int iovcnt,
+                                size_t total_user, uint32_t block_size);
+static ErrorCode ChunkedWriteOne(SpdkEnv &env, uint64_t disk_offset,
+                                 size_t aligned_len,
+                                 const iovec *iov, int iovcnt,
+                                 size_t total_user, uint32_t block_size);
+
 SpdkFile::SpdkFile(const std::string &filename, uint64_t base_offset,
                    uint64_t max_size)
     : StorageFile(filename, -1),
