@@ -768,30 +768,22 @@ static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
 // This two-thread split keeps reactors 100% dedicated to I/O processing.
 // ============================================================================
 
-static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
-                                           size_t total_bytes, bool is_write,
-                                           int iodepth) {
-    auto &env = SpdkEnv::Instance();
-    size_t aligned_chunk = spdk_align_up(chunk_size);
-    size_t total_ops = total_bytes / chunk_size;
-    if (total_ops == 0) return {};
-
-    constexpr size_t kMaxDmaTotal = 256ULL * 1024 * 1024;
-    int max_qd = std::max(2, static_cast<int>(kMaxDmaTotal / aligned_chunk));
-    int qd = std::min(iodepth, max_qd);
+// Worker for one thread's share of sequential I/O via SubmitIoBatchAsync.
+static void SeqDirectWorker(SpdkEnv &env, size_t chunk_size,
+                            size_t aligned_chunk, bool is_write,
+                            off_t start_offset, size_t my_ops, int qd,
+                            BandwidthResult *out) {
+    if (my_ops == 0) return;
 
     auto dma_bufs = std::make_unique<void *[]>(qd);
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_chunk, qd,
                                     env.GetBlockSize());
     if (got == 0) {
-        for (int try_qd = std::max(1, qd / 2); try_qd >= 1 && got == 0;
-             try_qd = try_qd > 1 ? try_qd / 2 : 0)
-            got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_chunk,
-                                        try_qd, env.GetBlockSize());
-        if (got == 0) {
-            LOG(ERROR) << "DMA alloc failed for seq bench";
-            return {};
-        }
+        for (int t = std::max(1, qd / 2); t >= 1 && got == 0;
+             t = t > 1 ? t / 2 : 0)
+            got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_chunk, t,
+                                        env.GetBlockSize());
+        if (got == 0) { LOG(ERROR) << "DMA alloc failed"; return; }
     }
     qd = got;
 
@@ -808,17 +800,15 @@ static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
     auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
     auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
 
-    int submitted = 0, completed = 0;
-    int head = 0, tail = 0;
-    off_t next_offset = 0;
+    int submitted = 0, completed = 0, head = 0, tail = 0;
+    off_t next_offset = start_offset;
 
-    BandwidthResult result;
     auto t0 = Clock::now();
 
-    while (completed < static_cast<int>(total_ops)) {
+    while (completed < static_cast<int>(my_ops)) {
         int batch_count = 0;
         while (submitted - completed < qd &&
-               submitted < static_cast<int>(total_ops)) {
+               submitted < static_cast<int>(my_ops)) {
             int slot = head;
             auto &req = reqs[slot];
             req.op = is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
@@ -854,56 +844,79 @@ static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
         while (completed < submitted) {
             if (!reqs[tail].completed.load(std::memory_order_acquire))
                 break;
-            result.total_bytes += chunk_size;
-            result.total_ops++;
+            out->total_bytes += chunk_size;
+            out->total_ops++;
             completed++;
             tail = (tail + 1) % qd;
         }
     }
 
-    result.total_secs =
+    out->total_secs =
         std::chrono::duration<double>(Clock::now() - t0).count();
     env.DmaPoolFreeBatch(dma_bufs.get(), aligned_chunk, qd);
-    return result;
 }
 
-// ---------------------------------------------------------------------------
-// Random I/O benchmark (same SubmitIoBatchAsync architecture as sequential)
-// ---------------------------------------------------------------------------
-
-static BandwidthResult BenchSpdkRandDirect(size_t io_size, size_t file_size,
-                                            int num_ops, bool is_write,
-                                            int iodepth,
-                                            bool collect_latency = false) {
+static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
+                                           size_t total_bytes, bool is_write,
+                                           int iodepth) {
     auto &env = SpdkEnv::Instance();
-    size_t aligned_io = spdk_align_up(io_size);
+    size_t aligned_chunk = spdk_align_up(chunk_size);
+    size_t total_ops = total_bytes / chunk_size;
+    if (total_ops == 0) return {};
 
+    // Match VALUE-level concurrency: multiple calling threads each with
+    // independent QD pipeline, so total NVMe QD = nthreads × per_qd.
+    int nthreads = std::max(1, env.GetNumReactors() * 2);
     constexpr size_t kMaxDmaTotal = 256ULL * 1024 * 1024;
-    int max_qd = std::max(2, static_cast<int>(kMaxDmaTotal / aligned_io));
-    int qd = std::min(iodepth, max_qd);
-    if (collect_latency) qd = std::min(qd, 1);
+    int per_qd = std::max(2, static_cast<int>(
+        kMaxDmaTotal / nthreads / aligned_chunk));
+    per_qd = std::min(iodepth, per_qd);
 
-    size_t block_align = 4096;
-    size_t max_off = (file_size - io_size) / block_align * block_align;
-    std::mt19937 gen(12345);
-    std::uniform_int_distribution<size_t> dist(0, max_off / block_align);
+    size_t ops_per_thread = total_ops / nthreads;
+    if (ops_per_thread == 0) { nthreads = 1; ops_per_thread = total_ops; }
 
-    std::vector<off_t> offsets(num_ops);
-    for (int i = 0; i < num_ops; ++i)
-        offsets[i] = static_cast<off_t>(dist(gen) * block_align);
+    std::vector<BandwidthResult> results(nthreads);
+    std::vector<std::thread> threads;
+
+    off_t offset = 0;
+    for (int t = 0; t < nthreads; t++) {
+        size_t my_ops = (t < nthreads - 1) ? ops_per_thread
+                                            : (total_ops - ops_per_thread * t);
+        threads.emplace_back(SeqDirectWorker, std::ref(env), chunk_size,
+                             aligned_chunk, is_write, offset, my_ops, per_qd,
+                             &results[t]);
+        offset += static_cast<off_t>(my_ops * chunk_size);
+    }
+
+    for (auto &th : threads) th.join();
+
+    BandwidthResult merged;
+    double max_secs = 0;
+    for (auto &r : results) {
+        merged.total_bytes += r.total_bytes;
+        merged.total_ops += r.total_ops;
+        max_secs = std::max(max_secs, r.total_secs);
+    }
+    merged.total_secs = max_secs;
+    return merged;
+}
+
+// Worker for one thread's share of random I/O via SubmitIoBatchAsync.
+static void RandDirectWorker(SpdkEnv &env, size_t io_size, size_t aligned_io,
+                             bool is_write, const off_t *offsets, int my_ops,
+                             int qd, bool collect_latency,
+                             BandwidthResult *out) {
+    if (my_ops == 0) return;
 
     auto dma_bufs = std::make_unique<void *[]>(qd);
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_io, qd,
                                     env.GetBlockSize());
     if (got == 0) {
-        for (int try_qd = std::max(1, qd / 2); try_qd >= 1 && got == 0;
-             try_qd = try_qd > 1 ? try_qd / 2 : 0)
-            got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_io,
-                                        try_qd, env.GetBlockSize());
-        if (got == 0) {
-            LOG(ERROR) << "DMA alloc failed for rand bench";
-            return {};
-        }
+        for (int t = std::max(1, qd / 2); t >= 1 && got == 0;
+             t = t > 1 ? t / 2 : 0)
+            got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_io, t,
+                                        env.GetBlockSize());
+        if (got == 0) { LOG(ERROR) << "DMA alloc failed"; return; }
     }
     qd = got;
 
@@ -924,15 +937,13 @@ static BandwidthResult BenchSpdkRandDirect(size_t io_size, size_t file_size,
     if (collect_latency)
         submit_ts = std::make_unique<Clock::time_point[]>(qd);
 
-    int submitted = 0, completed = 0;
-    int head = 0, tail = 0;
+    int submitted = 0, completed = 0, head = 0, tail = 0;
 
-    BandwidthResult result;
     auto t0 = Clock::now();
 
-    while (completed < num_ops) {
+    while (completed < my_ops) {
         int batch_count = 0;
-        while (submitted - completed < qd && submitted < num_ops) {
+        while (submitted - completed < qd && submitted < my_ops) {
             int slot = head;
             auto &req = reqs[slot];
             req.op = is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
@@ -971,20 +982,79 @@ static BandwidthResult BenchSpdkRandDirect(size_t io_size, size_t file_size,
             if (submit_ts) {
                 double us = std::chrono::duration<double, std::micro>(
                                 Clock::now() - submit_ts[tail]).count();
-                result.latency.Add(us);
+                out->latency.Add(us);
             }
-            result.total_bytes += io_size;
-            result.total_ops++;
+            out->total_bytes += io_size;
+            out->total_ops++;
             completed++;
             tail = (tail + 1) % qd;
         }
     }
 
-    result.total_secs =
+    out->total_secs =
         std::chrono::duration<double>(Clock::now() - t0).count();
-    result.latency.Sort();
     env.DmaPoolFreeBatch(dma_bufs.get(), aligned_io, qd);
-    return result;
+}
+
+static BandwidthResult BenchSpdkRandDirect(size_t io_size, size_t file_size,
+                                            int num_ops, bool is_write,
+                                            int iodepth,
+                                            bool collect_latency = false) {
+    auto &env = SpdkEnv::Instance();
+    size_t aligned_io = spdk_align_up(io_size);
+
+    size_t block_align = 4096;
+    size_t max_off = (file_size - io_size) / block_align * block_align;
+    std::mt19937 gen(12345);
+    std::uniform_int_distribution<size_t> dist(0, max_off / block_align);
+
+    std::vector<off_t> all_offsets(num_ops);
+    for (int i = 0; i < num_ops; ++i)
+        all_offsets[i] = static_cast<off_t>(dist(gen) * block_align);
+
+    // Latency test: single thread, QD=1
+    if (collect_latency) {
+        BandwidthResult result;
+        RandDirectWorker(env, io_size, aligned_io, is_write,
+                         all_offsets.data(), num_ops, 1, true, &result);
+        result.latency.Sort();
+        return result;
+    }
+
+    int nthreads = std::max(1, env.GetNumReactors() * 2);
+    constexpr size_t kMaxDmaTotal = 256ULL * 1024 * 1024;
+    int per_qd = std::max(2, static_cast<int>(
+        kMaxDmaTotal / nthreads / aligned_io));
+    per_qd = std::min(iodepth, per_qd);
+
+    int ops_per_thread = num_ops / nthreads;
+    if (ops_per_thread == 0) { nthreads = 1; ops_per_thread = num_ops; }
+
+    std::vector<BandwidthResult> results(nthreads);
+    std::vector<std::thread> threads;
+
+    int ops_assigned = 0;
+    for (int t = 0; t < nthreads; t++) {
+        int my_ops = (t < nthreads - 1) ? ops_per_thread
+                                         : (num_ops - ops_assigned);
+        threads.emplace_back(RandDirectWorker, std::ref(env), io_size,
+                             aligned_io, is_write,
+                             all_offsets.data() + ops_assigned,
+                             my_ops, per_qd, false, &results[t]);
+        ops_assigned += my_ops;
+    }
+
+    for (auto &th : threads) th.join();
+
+    BandwidthResult merged;
+    double max_secs = 0;
+    for (auto &r : results) {
+        merged.total_bytes += r.total_bytes;
+        merged.total_ops += r.total_ops;
+        max_secs = std::max(max_secs, r.total_secs);
+    }
+    merged.total_secs = max_secs;
+    return merged;
 }
 
 // ============================================================================
@@ -1262,9 +1332,11 @@ static void RunFileSeqBench() {
         return sum / (v.size() - 2);
     };
 
+    int spdk_nthreads = std::max(1, nc * 2);
     char spdk_col[64];
     std::snprintf(spdk_col, sizeof(spdk_col),
-                  "SPDK %dC QD=%d W/R MB/s", nc, FLAGS_iodepth);
+                  "SPDK %dC T=%d QD=%d W/R MB/s", nc, spdk_nthreads,
+                  FLAGS_iodepth);
 
     if (on_real_disk) {
         PrintSeparator(TW);
@@ -1420,9 +1492,11 @@ static void RunFileRandBench() {
 
     std::vector<int> ops_list = {10000, 50000, 200000};
 
+    int spdk_nthreads_r = std::max(1, nc * 2);
     char spdk_col[64];
     std::snprintf(spdk_col, sizeof(spdk_col),
-                  "SPDK %dC QD=%d W/R MB/s", nc, FLAGS_iodepth);
+                  "SPDK %dC T=%d QD=%d W/R MB/s", nc, spdk_nthreads_r,
+                  FLAGS_iodepth);
 
     if (on_real_disk) {
         PrintSeparator(TW);
