@@ -249,7 +249,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
 
     // Cap pipeline depth so total DMA allocation stays within a safe
     // hugepage budget (avoid OOM on small-memory machines).
-    constexpr size_t kDmaBudgetBytes = 512ULL * 1024 * 1024;
+    constexpr size_t kDmaBudgetBytes = 256ULL * 1024 * 1024;
     int max_qd_by_mem = max_aligned > 0
         ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
         : 128;
@@ -350,7 +350,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         if (al > max_aligned) max_aligned = al;
     }
 
-    constexpr size_t kDmaBudgetBytes = 512ULL * 1024 * 1024;
+    constexpr size_t kDmaBudgetBytes = 256ULL * 1024 * 1024;
     int max_qd_by_mem = max_aligned > 0
         ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
         : 128;

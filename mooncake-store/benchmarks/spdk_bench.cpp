@@ -1065,7 +1065,7 @@ static void RunBackendBench() {
     // Pre-warm DMA pool with pipeline-depth buffers, capped by hugepage budget
     {
         size_t warm_size = spdk_align_up(value_size + 4096 + 64);
-        constexpr size_t kDmaBudget = 512ULL * 1024 * 1024;
+        constexpr size_t kDmaBudget = 256ULL * 1024 * 1024;
         int max_qd = warm_size > 0
             ? std::max(4, static_cast<int>(kDmaBudget / warm_size))
             : 128;
@@ -1243,7 +1243,7 @@ static void RunBackendBench() {
         // Cap pipeline depth so total DMA allocation stays within hugepage
         // budget (~512MB safe limit for DMA buffers on small-memory machines).
         size_t warm_size = spdk_align_up(vsz + 4096 + 64);
-        constexpr size_t kDmaBudget = 512ULL * 1024 * 1024;
+        constexpr size_t kDmaBudget = 256ULL * 1024 * 1024;
         int max_qd_by_mem = warm_size > 0
             ? std::max(4, static_cast<int>(kDmaBudget / warm_size))
             : 128;
