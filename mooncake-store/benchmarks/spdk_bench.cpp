@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <unistd.h>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -545,9 +546,21 @@ struct BackendBenchResult {
     int64_t keys_written = 0;
 };
 
+// Drop kernel page cache (sync first to flush dirty pages, then drop).
+// Only meaningful for Posix paths; SPDK bypasses the kernel entirely.
+static void DropPageCache() {
+    ::sync();
+    int fd = ::open("/proc/sys/vm/drop_caches", O_WRONLY);
+    if (fd >= 0) {
+        [[maybe_unused]] auto _ = ::write(fd, "3", 1);
+        ::close(fd);
+    }
+}
+
 static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
                                        size_t num_keys, size_t value_size,
-                                       int threads, bool do_verify) {
+                                       int threads, bool do_verify,
+                                       bool cold_read = false) {
     BackendBenchResult result;
 
     auto no_op_handler = [](const std::vector<std::string> &,
@@ -637,6 +650,11 @@ static BackendBenchResult BenchBackend(OffsetAllocatorStorageBackend &be,
                   << offload_secs * 1e6 << "us  BW="
                   << std::setprecision(1) << result.offload_bw_mbps
                   << " MB/s\n";
+    }
+
+    // --- Cold-read barrier: flush and drop page cache ---
+    if (cold_read) {
+        DropPageCache();
     }
 
     // --- Load (read) — batch ALL keys per thread to exploit SPDK multi-core ---
@@ -1019,12 +1037,14 @@ static void RunBackendBench() {
     std::cout << "\n";
     PrintSeparator();
     const char *spdk_mode = FLAGS_nvme_pci_addr.empty() ? "malloc" : "NVMe";
+    bool on_real_disk = !FLAGS_nvme_pci_addr.empty();
     std::cout << "  BACKEND THROUGHPUT: OffsetAllocatorStorageBackend"
               << "  (SPDK=" << spdk_mode
               << ", keys=" << FLAGS_backend_keys
               << ", value=" << FLAGS_backend_value_kb << "KB"
               << ", threads=" << FLAGS_threads
-              << ", iterations=" << FLAGS_iterations << ")\n";
+              << ", iterations=" << FLAGS_iterations
+              << (on_real_disk ? ", cold=drop_caches" : "") << ")\n";
     PrintSeparator();
 
     namespace fs = std::filesystem;
@@ -1050,16 +1070,16 @@ static void RunBackendBench() {
     }
 
     // Header
-    std::cout << std::setw(8) << "Backend"
-              << "  │ " << std::setw(14) << "Offload MB/s"
-              << "  │ " << std::setw(14) << "Load MB/s"
-              << "  │ " << std::setw(14) << "Offload p99us"
-              << "  │ " << std::setw(14) << "Load p99us"
-              << "\n";
+    char thdr[512];
+    std::snprintf(thdr, sizeof(thdr),
+                  "%14s  │  %14s  │  %14s  │  %14s  │  %14s",
+                  "Backend", "Offload MB/s", "Load MB/s",
+                  "Offload p99us", "Load p99us");
+    std::cout << thdr << "\n";
     PrintSeparator();
 
     auto run_one = [&](const std::string &label, bool use_spdk,
-                       const std::string &dir) {
+                       const std::string &dir, bool cold_read) {
         std::vector<double> offload_bws, load_bws;
         LatencyStats offload_lat_agg, load_lat_agg;
 
@@ -1083,8 +1103,8 @@ static void RunBackendBench() {
             }
 
             bool verify_this = FLAGS_verify && (iter == 0);
-            auto res =
-                BenchBackend(be, num_keys, value_size, threads, verify_this);
+            auto res = BenchBackend(be, num_keys, value_size, threads,
+                                    verify_this, cold_read);
             offload_bws.push_back(res.offload_bw_mbps);
             load_bws.push_back(res.load_bw_mbps);
 
@@ -1110,14 +1130,17 @@ static void RunBackendBench() {
         char row[256];
         std::snprintf(
             row, sizeof(row),
-            "%8s  │  %10.1f     │  %10.1f     │  %10.1f     │  %10.1f",
+            "%14s  │  %10.1f     │  %10.1f     │  %10.1f     │  %10.1f",
             label.c_str(), ob, lb, offload_lat_agg.Percentile(99),
             load_lat_agg.Percentile(99));
         std::cout << row << "\n";
     };
 
-    run_one("Posix", false, posix_dir);
-    run_one("SPDK", true, spdk_dir);
+    run_one("Posix", false, posix_dir, false);
+    if (on_real_disk) {
+        run_one("Posix(cold)", false, posix_dir, true);
+    }
+    run_one("SPDK", true, spdk_dir, false);
 
     PrintSeparator();
 
@@ -1127,16 +1150,31 @@ static void RunBackendBench() {
     std::cout << "  VALUE SIZE SWEEP  (SPDK=" << spdk_mode
               << ", max_keys=" << num_keys
               << ", threads=" << threads
-              << ", bdev=" << FormatSize(env.GetBdevSize()) << ")\n";
-    PrintSeparator(120);
+              << ", bdev=" << FormatSize(env.GetBdevSize())
+              << (on_real_disk ? ", cold=drop_caches" : "") << ")\n";
 
-    std::cout << std::setw(12) << "ValueSize"
-              << std::setw(8) << "  Keys"
-              << "  │ " << std::setw(26) << "Posix Offload / Load MB/s"
-              << "  │ " << std::setw(26) << "SPDK  Offload / Load MB/s"
-              << "  │ " << std::setw(20) << "Speedup O / L"
-              << "\n";
-    PrintSeparator(120);
+    if (on_real_disk) {
+        PrintSeparator(160);
+        char shdr[512];
+        std::snprintf(shdr, sizeof(shdr),
+                      "%12s %5s  │  %26s  │  %26s  │  %26s  │  %14s  │  %14s",
+                      "ValueSize", "Keys",
+                      "Posix O / L(warm) MB/s",
+                      "Posix O / L(cold) MB/s",
+                      "SPDK  O / L MB/s",
+                      "Speedup O", "Speedup L(cold)");
+        std::cout << shdr << "\n";
+        PrintSeparator(160);
+    } else {
+        PrintSeparator(120);
+        std::cout << std::setw(12) << "ValueSize"
+                  << std::setw(8) << "  Keys"
+                  << "  │ " << std::setw(26) << "Posix Offload / Load MB/s"
+                  << "  │ " << std::setw(26) << "SPDK  Offload / Load MB/s"
+                  << "  │ " << std::setw(20) << "Speedup O / L"
+                  << "\n";
+        PrintSeparator(120);
+    }
 
     std::vector<size_t> value_sizes = {
         4096,            32 * 1024,       128 * 1024,
@@ -1153,32 +1191,51 @@ static void RunBackendBench() {
             effective_keys = std::min(num_keys, max_keys);
         }
 
-        double posix_ob = 0, posix_lb = 0, spdk_ob = 0, spdk_lb = 0;
+        double posix_ob = 0, posix_lb = 0;
+        double posix_cold_ob = 0, posix_cold_lb = 0;
+        double spdk_ob = 0, spdk_lb = 0;
 
-        // Posix
-        {
-            fs::create_directories(posix_dir);
+        auto make_posix_be = [&](const std::string &dir)
+            -> std::unique_ptr<OffsetAllocatorStorageBackend> {
+            fs::create_directories(dir);
             FileStorageConfig config;
-            config.storage_filepath = posix_dir;
+            config.storage_filepath = dir;
             config.storage_backend_type = StorageBackendType::kOffsetAllocator;
             config.total_size_limit =
                 static_cast<int64_t>(effective_keys * (vsz + 4096) * 2);
             config.total_keys_limit =
                 static_cast<int64_t>(effective_keys * 2);
             config.use_spdk = false;
+            auto be = std::make_unique<OffsetAllocatorStorageBackend>(config);
+            if (!be->Init().has_value()) return nullptr;
+            return be;
+        };
 
-            OffsetAllocatorStorageBackend be(config);
-            if (be.Init().has_value()) {
-                auto res = BenchBackend(be, effective_keys, vsz, threads, false);
+        // Posix warm read
+        {
+            auto be = make_posix_be(posix_dir);
+            if (be) {
+                auto res = BenchBackend(*be, effective_keys, vsz, threads,
+                                        false, false);
                 posix_ob = res.offload_bw_mbps;
                 posix_lb = res.load_bw_mbps;
             }
             fs::remove_all(posix_dir);
         }
 
+        // Posix cold read (only on real disk)
+        if (on_real_disk) {
+            auto be = make_posix_be(posix_dir);
+            if (be) {
+                auto res = BenchBackend(*be, effective_keys, vsz, threads,
+                                        false, true);
+                posix_cold_ob = res.offload_bw_mbps;
+                posix_cold_lb = res.load_bw_mbps;
+            }
+            fs::remove_all(posix_dir);
+        }
+
         // Pre-warm DMA pool for this specific value size.
-        // Allocate exactly pipeline-QD buffers so spdk_dma_malloc cost
-        // is excluded from the timed benchmark, then drain after.
         int sweep_qd = std::min(static_cast<int>(effective_keys), 128);
         size_t warm_size = spdk_align_up(vsz + 4096 + 64);
         env.DmaPoolDrain();
@@ -1199,7 +1256,8 @@ static void RunBackendBench() {
 
             OffsetAllocatorStorageBackend be(config);
             if (be.Init().has_value()) {
-                auto res = BenchBackend(be, effective_keys, vsz, threads, false);
+                auto res = BenchBackend(be, effective_keys, vsz, threads,
+                                        false, false);
                 spdk_ob = res.offload_bw_mbps;
                 spdk_lb = res.load_bw_mbps;
             }
@@ -1207,18 +1265,37 @@ static void RunBackendBench() {
         }
         env.DmaPoolDrain();
 
-        char row[300];
-        std::snprintf(
-            row, sizeof(row),
-            "%12s  %5zu  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  "
-            "%6.2fx / %.2fx",
-            FormatSize(vsz).c_str(), effective_keys, posix_ob, posix_lb,
-            spdk_ob, spdk_lb,
-            posix_ob > 0 ? spdk_ob / posix_ob : 0,
-            posix_lb > 0 ? spdk_lb / posix_lb : 0);
-        std::cout << row << "\n";
+        if (on_real_disk) {
+            double cold_lb = posix_cold_lb > 0 ? posix_cold_lb : posix_lb;
+            char row[512];
+            std::snprintf(
+                row, sizeof(row),
+                "%12s  %5zu  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │"
+                "  %10.1f / %-10.1f   │  %10.2fx    │  %10.2fx",
+                FormatSize(vsz).c_str(), effective_keys,
+                posix_ob, posix_lb,
+                posix_cold_ob, posix_cold_lb,
+                spdk_ob, spdk_lb,
+                posix_ob > 0 ? spdk_ob / posix_ob : 0,
+                cold_lb > 0 ? spdk_lb / cold_lb : 0);
+            std::cout << row << "\n";
+        } else {
+            char row[300];
+            std::snprintf(
+                row, sizeof(row),
+                "%12s  %5zu  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  "
+                "%6.2fx / %.2fx",
+                FormatSize(vsz).c_str(), effective_keys, posix_ob, posix_lb,
+                spdk_ob, spdk_lb,
+                posix_ob > 0 ? spdk_ob / posix_ob : 0,
+                posix_lb > 0 ? spdk_lb / posix_lb : 0);
+            std::cout << row << "\n";
+        }
     }
-    PrintSeparator();
+    if (on_real_disk)
+        PrintSeparator(160);
+    else
+        PrintSeparator();
 }
 
 // ============================================================================
