@@ -247,7 +247,13 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
         if (al > max_aligned) max_aligned = al;
     }
 
-    int qd = std::min(count, 128);
+    // Cap pipeline depth so total DMA allocation stays within a safe
+    // hugepage budget (avoid OOM on small-memory machines).
+    constexpr size_t kDmaBudgetBytes = 512ULL * 1024 * 1024;
+    int max_qd_by_mem = max_aligned > 0
+        ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
+        : 128;
+    int qd = std::min({count, 128, max_qd_by_mem});
 
     auto dma_bufs = std::make_unique<void *[]>(qd);
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
@@ -344,7 +350,11 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         if (al > max_aligned) max_aligned = al;
     }
 
-    int qd = std::min(count, 128);
+    constexpr size_t kDmaBudgetBytes = 512ULL * 1024 * 1024;
+    int max_qd_by_mem = max_aligned > 0
+        ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
+        : 128;
+    int qd = std::min({count, 128, max_qd_by_mem});
 
     auto dma_bufs = std::make_unique<void *[]>(qd);
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
