@@ -62,8 +62,8 @@ DEFINE_int32(threads, 1,
              "Thread count for concurrent backend test (default: 1)");
 DEFINE_int32(iodepth, 128,
              "I/O queue depth for SPDK async benchmarks (default: 128)");
-DEFINE_int32(cores, 8,
-             "Number of SPDK reactor cores (default: 8)");
+DEFINE_int32(cores, 2,
+             "Number of SPDK reactor cores (default: 2, sufficient for single NVMe)");
 DEFINE_bool(profile, false,
             "Enable per-phase timing breakdown (pass --v=1 for backend detail)");
 DEFINE_string(nvme_pci_addr, "",
@@ -809,9 +809,8 @@ static void RunFileSeqBench() {
         128ULL * 1024 * 1024, 256ULL * 1024 * 1024, 512ULL * 1024 * 1024};
 
     uint64_t bdev_size = env.GetBdevSize();
-    size_t total_data = bdev_size / 2;
-    if (total_data > 256ULL * 1024 * 1024)
-        total_data = 256ULL * 1024 * 1024;
+    size_t default_total = 256ULL * 1024 * 1024;
+    size_t total_data = std::min(bdev_size / 2, default_total);
 
     int nc = env.GetNumReactors();
 
@@ -825,15 +824,15 @@ static void RunFileSeqBench() {
     };
 
     if (on_real_disk) {
-        PrintSeparator(160);
+        PrintSeparator(180);
         char hdr[512];
         std::snprintf(hdr, sizeof(hdr),
-            "%12s  │  %26s  │  %14s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %10s  │  %14s",
-            "ChunkSize", "Posix W / R(warm) MB/s",
-            "Posix R(cold)", nc, FLAGS_iodepth,
-            "Speedup W", "Speedup R(cold)");
+            "%12s  │  %26s  │  %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %14s  │  %14s",
+            "ChunkSize", "Posix(warm) W / R MB/s",
+            "Posix(cold) W / R MB/s", nc, FLAGS_iodepth,
+            "Speedup W(cold)", "Speedup R(cold)");
         std::cout << hdr << "\n";
-        PrintSeparator(160);
+        PrintSeparator(180);
     } else {
         PrintSeparator();
         char hdr[256];
@@ -846,16 +845,15 @@ static void RunFileSeqBench() {
     }
 
     for (size_t chunk : chunk_sizes) {
-        if (chunk > total_data) {
+        size_t effective_total = std::max(total_data, chunk * 2);
+        if (effective_total > bdev_size / 2) {
             std::cout << std::setw(12) << FormatSize(chunk).c_str()
-                      << "  │  (skipped — chunk > total_data "
-                      << FormatSize(total_data) << ")\n";
+                      << "  │  (skipped — exceeds bdev capacity)\n";
             continue;
         }
-        size_t effective_total = std::max(total_data, chunk * 4);
-        if (effective_total > bdev_size) effective_total = total_data;
 
-        std::vector<double> posix_w, posix_r, posix_cold_r;
+        std::vector<double> posix_w, posix_r;
+        std::vector<double> posix_cold_w, posix_cold_r;
         std::vector<double> spdk_w, spdk_r;
 
         for (int iter = 0; iter < FLAGS_iterations; ++iter) {
@@ -876,7 +874,6 @@ static void RunFileSeqBench() {
                     return;
                 }
                 PosixFile pf(FLAGS_posix_path, fd);
-
                 auto wr = BenchFileSeq(pf, chunk, effective_total, true, false);
                 auto rd = BenchFileSeq(pf, chunk, effective_total, false,
                                        verify_this);
@@ -884,16 +881,30 @@ static void RunFileSeqBench() {
                 posix_r.push_back(rd.BW_MBps());
             }
 
-            // --- Posix cold read (drop page cache, re-read) ---
+            // --- Posix cold (drop cache, then write + read from disk) ---
             if (on_real_disk) {
                 DropPageCache();
-                int fd = open(FLAGS_posix_path.c_str(),
-                              OpenPosixFlags(false), 0644);
-                if (fd >= 0) {
-                    PosixFile pf(FLAGS_posix_path, fd);
-                    auto rd = BenchFileSeq(pf, chunk, effective_total, false,
-                                           false);
-                    posix_cold_r.push_back(rd.BW_MBps());
+                {
+                    int fd = open(FLAGS_posix_path.c_str(),
+                                  OpenPosixFlags(true), 0644);
+                    if (fd >= 0) {
+                        ftruncate(fd, effective_total);
+                        PosixFile pf(FLAGS_posix_path, fd);
+                        auto wr = BenchFileSeq(pf, chunk, effective_total,
+                                               true, false);
+                        posix_cold_w.push_back(wr.BW_MBps());
+                    }
+                }
+                DropPageCache();
+                {
+                    int fd = open(FLAGS_posix_path.c_str(),
+                                  OpenPosixFlags(false), 0644);
+                    if (fd >= 0) {
+                        PosixFile pf(FLAGS_posix_path, fd);
+                        auto rd = BenchFileSeq(pf, chunk, effective_total,
+                                               false, false);
+                        posix_cold_r.push_back(rd.BW_MBps());
+                    }
                 }
             }
             unlink(FLAGS_posix_path.c_str());
@@ -910,17 +921,17 @@ static void RunFileSeqBench() {
         }
 
         double pw = trimmed_mean(posix_w), pr = trimmed_mean(posix_r);
-        double sw = trimmed_mean(spdk_w), sr = trimmed_mean(spdk_r);
+        double pcw = posix_cold_w.empty() ? 0 : trimmed_mean(posix_cold_w);
         double pcr = posix_cold_r.empty() ? 0 : trimmed_mean(posix_cold_r);
+        double sw = trimmed_mean(spdk_w), sr = trimmed_mean(spdk_r);
 
         if (on_real_disk) {
-            double cold_r = pcr > 0 ? pcr : pr;
             char row[512];
             std::snprintf(row, sizeof(row),
-                "%12s  │  %10.1f / %-10.1f   │  %10.1f     │  %10.1f / %-10.1f   │  %8.2fx  │  %12.2fx",
-                FormatSize(chunk).c_str(), pw, pr, pcr, sw, sr,
-                pw > 0 ? sw / pw : 0,
-                cold_r > 0 ? sr / cold_r : 0);
+                "%12s  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  %12.2fx  │  %12.2fx",
+                FormatSize(chunk).c_str(), pw, pr, pcw, pcr, sw, sr,
+                pcw > 0 ? sw / pcw : 0,
+                pcr > 0 ? sr / pcr : 0);
             std::cout << row << "\n";
         } else {
             char row[256];
@@ -932,7 +943,7 @@ static void RunFileSeqBench() {
             std::cout << row << "\n";
         }
     }
-    PrintSeparator(on_real_disk ? 160 : 110);
+    PrintSeparator(on_real_disk ? 180 : 110);
 }
 
 // ============================================================================
@@ -944,14 +955,16 @@ static void RunFileRandBench() {
     const char *spdk_mode = FLAGS_nvme_pci_addr.empty() ? "malloc" : "NVMe";
     const char *posix_mode = FLAGS_posix_direct ? "O_DIRECT" : "cached";
 
+    bool on_real_disk = !FLAGS_nvme_pci_addr.empty();
+
     std::cout << "\n";
-    PrintSeparator();
+    PrintSeparator(on_real_disk ? 180 : 110);
     std::cout << "  FILE-LEVEL RANDOM I/O  (4KB blocks, SPDK=" << spdk_mode
               << ", Posix=" << posix_mode
               << ", cores=" << FLAGS_cores
               << ", iodepth=" << FLAGS_iodepth
-              << ", iterations=" << FLAGS_iterations << ")\n";
-    PrintSeparator();
+              << ", iterations=" << FLAGS_iterations
+              << (on_real_disk ? ", cold=drop_caches" : "") << ")\n";
 
     uint64_t bdev_size = env.GetBdevSize();
     size_t file_size = bdev_size / 2;
@@ -961,19 +974,41 @@ static void RunFileRandBench() {
 
     std::vector<int> ops_list = {10000, 50000, 200000};
 
-    char rhdr[512];
-    std::snprintf(rhdr, sizeof(rhdr),
-                  "%10s  │ %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │ %20s",
-                  "NumOps", "Posix W / R (MB/s)",
-                  nc, FLAGS_iodepth, "Speedup W / R");
-    std::cout << rhdr << "\n";
-    PrintSeparator();
+    if (on_real_disk) {
+        PrintSeparator(180);
+        char rhdr[512];
+        std::snprintf(rhdr, sizeof(rhdr),
+            "%10s  │  %26s  │  %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %14s  │  %14s",
+            "NumOps", "Posix(warm) W / R MB/s",
+            "Posix(cold) W / R MB/s", nc, FLAGS_iodepth,
+            "Speedup W(cold)", "Speedup R(cold)");
+        std::cout << rhdr << "\n";
+        PrintSeparator(180);
+    } else {
+        PrintSeparator();
+        char rhdr[512];
+        std::snprintf(rhdr, sizeof(rhdr),
+            "%10s  │  %26s  │  SPDK %dC QD=%-3d W/R (MB/s) │  %20s",
+            "NumOps", "Posix W / R (MB/s)", nc, FLAGS_iodepth,
+            "Speedup W / R");
+        std::cout << rhdr << "\n";
+        PrintSeparator();
+    }
+
+    auto trimmed_mean_rand = [](std::vector<double> &v) -> double {
+        std::sort(v.begin(), v.end());
+        if (v.size() <= 2)
+            return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+        double sum = 0;
+        for (size_t i = 1; i + 1 < v.size(); ++i) sum += v[i];
+        return sum / (v.size() - 2);
+    };
 
     for (int num_ops : ops_list) {
-        std::vector<double> pw_mb_v, pr_mb_v, sw_mb_v, sr_mb_v;
+        std::vector<double> pw_v, pr_v, pcw_v, pcr_v, sw_v, sr_v;
 
         for (int iter = 0; iter < FLAGS_iterations; ++iter) {
-            // Pre-fill Posix
+            // Pre-fill Posix + SPDK
             {
                 int fd = open(FLAGS_posix_path.c_str(),
                               OpenPosixFlags(true), 0644);
@@ -983,70 +1018,99 @@ static void RunFileRandBench() {
                     BenchFileSeq(pf, 1024 * 1024, file_size, true, false);
                 }
             }
-
-            // Pre-fill SPDK via async sequential write
             BenchSpdkSeqAsync(1024 * 1024, file_size, true, false,
                               FLAGS_iodepth);
 
-            // Posix random (sync)
+            // Posix warm random
             {
                 int fd = open(FLAGS_posix_path.c_str(),
                               OpenPosixFlags(false), 0644);
                 PosixFile pf(FLAGS_posix_path, fd);
                 auto wr = BenchFileRand(pf, 4096, file_size, num_ops, true);
                 auto rd = BenchFileRand(pf, 4096, file_size, num_ops, false);
-                pw_mb_v.push_back(wr.BW_MBps());
-                pr_mb_v.push_back(rd.BW_MBps());
+                pw_v.push_back(wr.BW_MBps());
+                pr_v.push_back(rd.BW_MBps());
+            }
+
+            // Posix cold random
+            if (on_real_disk) {
+                DropPageCache();
+                int fd = open(FLAGS_posix_path.c_str(),
+                              OpenPosixFlags(false), 0644);
+                if (fd >= 0) {
+                    PosixFile pf(FLAGS_posix_path, fd);
+                    auto wr = BenchFileRand(pf, 4096, file_size, num_ops,
+                                            true);
+                    auto rd = BenchFileRand(pf, 4096, file_size, num_ops,
+                                            false);
+                    pcw_v.push_back(wr.BW_MBps());
+                    pcr_v.push_back(rd.BW_MBps());
+                }
             }
             unlink(FLAGS_posix_path.c_str());
 
-            // SPDK random (async pipeline)
+            // SPDK random
             {
                 auto wr = BenchSpdkRandAsync(4096, file_size, num_ops, true,
                                              FLAGS_iodepth);
                 auto rd = BenchSpdkRandAsync(4096, file_size, num_ops, false,
                                              FLAGS_iodepth);
-                sw_mb_v.push_back(wr.BW_MBps());
-                sr_mb_v.push_back(rd.BW_MBps());
+                sw_v.push_back(wr.BW_MBps());
+                sr_v.push_back(rd.BW_MBps());
             }
         }
 
-        auto trimmed_mean = [](std::vector<double> &v) -> double {
-            std::sort(v.begin(), v.end());
-            if (v.size() <= 2)
-                return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
-            double sum = 0;
-            for (size_t i = 1; i + 1 < v.size(); ++i) sum += v[i];
-            return sum / (v.size() - 2);
-        };
+        double pw = trimmed_mean_rand(pw_v), pr = trimmed_mean_rand(pr_v);
+        double pcw = pcw_v.empty() ? 0 : trimmed_mean_rand(pcw_v);
+        double pcr = pcr_v.empty() ? 0 : trimmed_mean_rand(pcr_v);
+        double sw = trimmed_mean_rand(sw_v), sr = trimmed_mean_rand(sr_v);
 
-        double pw_mb = trimmed_mean(pw_mb_v), pr_mb = trimmed_mean(pr_mb_v);
-        double sw_mb = trimmed_mean(sw_mb_v), sr_mb = trimmed_mean(sr_mb_v);
-
-        char row[512];
-        std::snprintf(row, sizeof(row),
-                      "%10d  │  %10.1f / %-10.1f   │  "
-                      "%10.1f / %-10.1f   │  %6.2fx / %.2fx",
-                      num_ops, pw_mb, pr_mb, sw_mb, sr_mb,
-                      pw_mb > 0 ? sw_mb / pw_mb : 0,
-                      pr_mb > 0 ? sr_mb / pr_mb : 0);
-        std::cout << row << "\n";
+        if (on_real_disk) {
+            char row[512];
+            std::snprintf(row, sizeof(row),
+                "%10d  │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  %10.1f / %-10.1f   │  %12.2fx  │  %12.2fx",
+                num_ops, pw, pr, pcw, pcr, sw, sr,
+                pcw > 0 ? sw / pcw : 0, pcr > 0 ? sr / pcr : 0);
+            std::cout << row << "\n";
+        } else {
+            char row[512];
+            std::snprintf(row, sizeof(row),
+                "%10d  │  %10.1f / %-10.1f   │  "
+                "%10.1f / %-10.1f   │  %6.2fx / %.2fx",
+                num_ops, pw, pr, sw, sr,
+                pw > 0 ? sw / pw : 0, pr > 0 ? sr / pr : 0);
+            std::cout << row << "\n";
+        }
     }
+    PrintSeparator(on_real_disk ? 180 : 110);
 
     // Latency comparison: 4KB random I/O at QD=1 (industry-standard latency test)
     constexpr int kLatencyOps = 50000;
     std::cout << "\n";
-    PrintSeparator();
+    int lat_width = on_real_disk ? 145 : 100;
+    PrintSeparator(lat_width);
     std::cout << "  4KB RANDOM I/O LATENCY (us)  —  QD=1, " << kLatencyOps
-              << " ops\n";
-    PrintSeparator();
-    char lat_hdr[256];
-    std::snprintf(lat_hdr, sizeof(lat_hdr),
-                  "%10s  │  %10s  %10s  %10s  │  %10s  %10s  %10s",
-                  "", "Posix p50", "p99", "p99.9",
-                  "SPDK p50", "p99", "p99.9");
-    std::cout << lat_hdr << "\n";
-    PrintSeparator();
+              << " ops"
+              << (on_real_disk ? ", cold=drop_caches" : "") << "\n";
+    PrintSeparator(lat_width);
+
+    if (on_real_disk) {
+        char lat_hdr[512];
+        std::snprintf(lat_hdr, sizeof(lat_hdr),
+            "%14s  │  %10s  %10s  %10s  │  %10s  %10s  %10s  │  %10s  %10s  %10s",
+            "", "Warm p50", "p99", "p99.9",
+            "Cold p50", "p99", "p99.9",
+            "SPDK p50", "p99", "p99.9");
+        std::cout << lat_hdr << "\n";
+    } else {
+        char lat_hdr[256];
+        std::snprintf(lat_hdr, sizeof(lat_hdr),
+            "%14s  │  %10s  %10s  %10s  │  %10s  %10s  %10s",
+            "", "Posix p50", "p99", "p99.9",
+            "SPDK p50", "p99", "p99.9");
+        std::cout << lat_hdr << "\n";
+    }
+    PrintSeparator(lat_width);
 
     // Pre-fill both
     {
@@ -1059,7 +1123,7 @@ static void RunFileRandBench() {
     }
     BenchSpdkSeqAsync(1024 * 1024, file_size, true, false, FLAGS_iodepth);
 
-    // Posix latency (sync, QD=1 by nature)
+    // Posix warm latency (page cache hot)
     BandwidthResult posix_wlat, posix_rlat;
     {
         int fd = open(FLAGS_posix_path.c_str(), OpenPosixFlags(false), 0644);
@@ -1067,28 +1131,64 @@ static void RunFileRandBench() {
         posix_wlat = BenchFileRand(pf, 4096, file_size, kLatencyOps, true);
         posix_rlat = BenchFileRand(pf, 4096, file_size, kLatencyOps, false);
     }
+
+    // Posix cold latency (drop cache, measure from disk)
+    BandwidthResult posix_cold_wlat, posix_cold_rlat;
+    if (on_real_disk) {
+        DropPageCache();
+        int fd = open(FLAGS_posix_path.c_str(), OpenPosixFlags(false), 0644);
+        if (fd >= 0) {
+            PosixFile pf(FLAGS_posix_path, fd);
+            posix_cold_wlat =
+                BenchFileRand(pf, 4096, file_size, kLatencyOps, true);
+            DropPageCache();
+            posix_cold_rlat =
+                BenchFileRand(pf, 4096, file_size, kLatencyOps, false);
+        }
+    }
     unlink(FLAGS_posix_path.c_str());
 
     // SPDK latency at QD=1
     auto spdk_wlat = BenchSpdkRandAsync(4096, file_size, kLatencyOps, true, 1);
     auto spdk_rlat = BenchSpdkRandAsync(4096, file_size, kLatencyOps, false, 1);
 
-    auto print_lat_row = [](const char *label, const LatencyStats &posix,
-                            const LatencyStats &spdk) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf),
-                      "%10s  │  %10.2f  %10.2f  %10.2f  │  %10.2f  %10.2f  %10.2f",
-                      label,
-                      posix.Percentile(50), posix.Percentile(99),
-                      posix.Percentile(99.9),
-                      spdk.Percentile(50), spdk.Percentile(99),
-                      spdk.Percentile(99.9));
-        std::cout << buf << "\n";
-    };
-
-    print_lat_row("Write", posix_wlat.latency, spdk_wlat.latency);
-    print_lat_row("Read", posix_rlat.latency, spdk_rlat.latency);
-    PrintSeparator();
+    if (on_real_disk) {
+        auto print_lat_row_3 = [](const char *label, const LatencyStats &warm,
+                                  const LatencyStats &cold,
+                                  const LatencyStats &spdk) {
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                "%14s  │  %10.2f  %10.2f  %10.2f  │  %10.2f  %10.2f  %10.2f  │  %10.2f  %10.2f  %10.2f",
+                label,
+                warm.Percentile(50), warm.Percentile(99),
+                warm.Percentile(99.9),
+                cold.Percentile(50), cold.Percentile(99),
+                cold.Percentile(99.9),
+                spdk.Percentile(50), spdk.Percentile(99),
+                spdk.Percentile(99.9));
+            std::cout << buf << "\n";
+        };
+        print_lat_row_3("Write", posix_wlat.latency, posix_cold_wlat.latency,
+                        spdk_wlat.latency);
+        print_lat_row_3("Read", posix_rlat.latency, posix_cold_rlat.latency,
+                        spdk_rlat.latency);
+    } else {
+        auto print_lat_row = [](const char *label, const LatencyStats &posix,
+                                const LatencyStats &spdk) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                "%14s  │  %10.2f  %10.2f  %10.2f  │  %10.2f  %10.2f  %10.2f",
+                label,
+                posix.Percentile(50), posix.Percentile(99),
+                posix.Percentile(99.9),
+                spdk.Percentile(50), spdk.Percentile(99),
+                spdk.Percentile(99.9));
+            std::cout << buf << "\n";
+        };
+        print_lat_row("Write", posix_wlat.latency, spdk_wlat.latency);
+        print_lat_row("Read", posix_rlat.latency, spdk_rlat.latency);
+    }
+    PrintSeparator(lat_width);
 }
 
 // ============================================================================
@@ -1204,7 +1304,7 @@ static void RunBackendBench() {
         std::cout << row << "\n";
     };
 
-    run_one("Posix", false, posix_dir, false);
+    run_one(on_real_disk ? "Posix(warm)" : "Posix", false, posix_dir, false);
     if (on_real_disk) {
         run_one("Posix(cold)", false, posix_dir, true);
     }
