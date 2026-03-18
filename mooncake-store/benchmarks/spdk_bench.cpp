@@ -1063,15 +1063,17 @@ static void RunBackendBench() {
     int threads = FLAGS_threads;
     int iters = FLAGS_iterations;
 
-    // Pre-warm DMA pool with pipeline-depth buffers, capped by hugepage budget
+    // Pre-warm DMA pool: allocate enough buffers for ALL concurrent threads
     {
         size_t warm_size = spdk_align_up(value_size + 4096 + 64);
         constexpr size_t kDmaBudget = 256ULL * 1024 * 1024;
-        int max_qd = warm_size > 0
+        int max_qd_total = warm_size > 0
             ? std::max(4, static_cast<int>(kDmaBudget / warm_size))
             : 128;
-        int qd = std::min(128, max_qd);
-        env.DmaPoolPrewarm(warm_size, qd, env.GetBlockSize());
+        int per_thread_qd = std::max(4, max_qd_total / std::max(1, threads));
+        per_thread_qd = std::min(per_thread_qd, 128);
+        int total_warm = per_thread_qd * threads;
+        env.DmaPoolPrewarm(warm_size, total_warm, env.GetBlockSize());
     }
 
     // Header
@@ -1183,9 +1185,10 @@ static void RunBackendBench() {
     }
 
     std::vector<size_t> value_sizes = {
-        4096,            32 * 1024,       128 * 1024,
-        512 * 1024,      2 * 1024 * 1024, 8 * 1024 * 1024,
-        16 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024};
+        4096,              32 * 1024,        128 * 1024,
+        512 * 1024,        2ULL * 1024 * 1024,  8ULL * 1024 * 1024,
+        16ULL * 1024 * 1024, 32ULL * 1024 * 1024, 64ULL * 1024 * 1024,
+        128ULL * 1024 * 1024, 256ULL * 1024 * 1024, 512ULL * 1024 * 1024};
 
     for (size_t vsz : value_sizes) {
         uint64_t bdev_cap = env.GetBdevSize();
@@ -1241,18 +1244,19 @@ static void RunBackendBench() {
             fs::remove_all(posix_dir);
         }
 
-        // Pre-warm DMA pool for this specific value size.
-        // Cap pipeline depth so total DMA allocation stays within hugepage
-        // budget (~512MB safe limit for DMA buffers on small-memory machines).
+        // Pre-warm DMA pool for ALL concurrent threads at this value size.
         size_t warm_size = spdk_align_up(vsz + 4096 + 64);
         constexpr size_t kDmaBudget = 256ULL * 1024 * 1024;
-        int max_qd_by_mem = warm_size > 0
+        int max_qd_total = warm_size > 0
             ? std::max(4, static_cast<int>(kDmaBudget / warm_size))
             : 128;
-        int sweep_qd = std::min({static_cast<int>(effective_keys), 128,
-                                 max_qd_by_mem});
+        int per_thread_qd = std::max(4,
+            std::min(128, max_qd_total / std::max(1, threads)));
+        int sweep_qd = std::min(per_thread_qd,
+                                static_cast<int>(effective_keys));
+        int total_warm = sweep_qd * threads;
         env.DmaPoolDrain();
-        env.DmaPoolPrewarm(warm_size, sweep_qd, env.GetBlockSize());
+        env.DmaPoolPrewarm(warm_size, total_warm, env.GetBlockSize());
 
         // SPDK
         {

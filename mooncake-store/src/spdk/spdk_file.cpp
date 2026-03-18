@@ -247,8 +247,6 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
         if (al > max_aligned) max_aligned = al;
     }
 
-    // Cap pipeline depth so total DMA allocation stays within a safe
-    // hugepage budget (avoid OOM on small-memory machines).
     constexpr size_t kDmaBudgetBytes = 256ULL * 1024 * 1024;
     int max_qd_by_mem = max_aligned > 0
         ? std::max(4, static_cast<int>(kDmaBudgetBytes / max_aligned))
@@ -259,11 +257,20 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
                                     block_size_);
     if (got == 0) {
-        LOG(ERROR) << "SpdkFile: write_batch DMA alloc got 0 buffers"
-                   << " (requested=" << qd << " × " << max_aligned << ")";
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    if (got < qd) {
+        for (int try_qd = std::max(1, qd / 2); try_qd >= 1 && got == 0;
+             try_qd = try_qd > 1 ? try_qd / 2 : 0) {
+            got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned,
+                                        try_qd, block_size_);
+        }
+        if (got == 0) {
+            LOG(ERROR) << "SpdkFile: write_batch DMA alloc got 0 buffers"
+                       << " after retries (requested=" << qd
+                       << " × " << max_aligned << ")";
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        LOG(WARNING) << "SpdkFile: write_batch DMA alloc retried, got "
+                     << got << "/" << qd << " × " << max_aligned;
+    } else if (got < qd) {
         LOG(WARNING) << "SpdkFile: write_batch DMA alloc partial "
                      << got << "/" << qd << " × " << max_aligned;
     }
@@ -365,11 +372,20 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
     int got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned, qd,
                                     block_size_);
     if (got == 0) {
-        LOG(ERROR) << "SpdkFile: read_batch DMA alloc got 0 buffers"
-                   << " (requested=" << qd << " × " << max_aligned << ")";
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    }
-    if (got < qd) {
+        for (int try_qd = std::max(1, qd / 2); try_qd >= 1 && got == 0;
+             try_qd = try_qd > 1 ? try_qd / 2 : 0) {
+            got = env.DmaPoolAllocBatch(dma_bufs.get(), max_aligned,
+                                        try_qd, block_size_);
+        }
+        if (got == 0) {
+            LOG(ERROR) << "SpdkFile: read_batch DMA alloc got 0 buffers"
+                       << " after retries (requested=" << qd
+                       << " × " << max_aligned << ")";
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        LOG(WARNING) << "SpdkFile: read_batch DMA alloc retried, got "
+                     << got << "/" << qd << " × " << max_aligned;
+    } else if (got < qd) {
         LOG(WARNING) << "SpdkFile: read_batch DMA alloc partial "
                      << got << "/" << qd << " × " << max_aligned;
     }

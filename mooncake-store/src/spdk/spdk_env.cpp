@@ -582,14 +582,11 @@ int SpdkEnv::DmaPoolAllocBatch(void **out_bufs, size_t needed, int count,
     for (int i = got; i < count; ++i) {
         out_bufs[i] = spdk_dma_malloc(needed, align, nullptr);
         if (!out_bufs[i]) {
-            if (got < count) {
-                LOG(WARNING) << "DmaPoolAllocBatch: pool=" << pool_total
-                             << " match=" << pool_match
-                             << " from_pool=" << from_pool
-                             << " malloc_fail_at=" << i
-                             << " needed=" << needed
-                             << " requested=" << count;
-            }
+            LOG(ERROR) << "DmaPoolAllocBatch FAIL: pool_total=" << pool_total
+                       << " pool_match=" << pool_match
+                       << " from_pool=" << from_pool
+                       << " malloc_fail_at=" << i
+                       << " needed=" << needed << " count=" << count;
             return i;
         }
         ++got;
@@ -599,9 +596,12 @@ int SpdkEnv::DmaPoolAllocBatch(void **out_bufs, size_t needed, int count,
 
 void SpdkEnv::DmaPoolFreeBatch(void *const *bufs, size_t size, int count) {
     std::lock_guard<std::mutex> lk(dma_pool_mutex_);
-    dma_pool_.reserve(dma_pool_.size() + count);
+    size_t before = dma_pool_.size();
+    dma_pool_.reserve(before + count);
     for (int i = 0; i < count; ++i)
         dma_pool_.push_back({bufs[i], size});
+    VLOG(1) << "DmaPoolFreeBatch: +" << count << " × " << size
+            << " pool " << before << " → " << dma_pool_.size();
 }
 
 void SpdkEnv::DmaPoolPrewarm(size_t buf_size, int count, size_t align) {
@@ -614,16 +614,27 @@ void SpdkEnv::DmaPoolPrewarm(size_t buf_size, int count, size_t align) {
     }
     if (ok > 0)
         DmaPoolFreeBatch(bufs.get(), buf_size, ok);
-    LOG(INFO) << "SpdkEnv: DMA pool pre-warmed " << ok << " × "
-              << buf_size << " bytes";
+    if (ok < count) {
+        LOG(ERROR) << "SpdkEnv: DMA pool pre-warm PARTIAL " << ok << "/"
+                   << count << " × " << buf_size
+                   << " bytes (total=" << ok * buf_size / (1024*1024) << "MB)";
+    } else {
+        LOG(INFO) << "SpdkEnv: DMA pool pre-warmed " << ok << " × "
+                  << buf_size << " bytes";
+    }
 }
 
 void SpdkEnv::DmaPoolDrain() {
     std::lock_guard<std::mutex> lk(dma_pool_mutex_);
-    for (auto &e : dma_pool_) spdk_dma_free(e.buf);
+    size_t total_bytes = 0;
+    for (auto &e : dma_pool_) {
+        total_bytes += e.size;
+        spdk_dma_free(e.buf);
+    }
     size_t n = dma_pool_.size();
     dma_pool_.clear();
-    LOG(INFO) << "SpdkEnv: DMA pool drained " << n << " buffers";
+    LOG(WARNING) << "SpdkEnv: DMA pool drained " << n << " buffers ("
+                 << total_bytes / (1024*1024) << "MB)";
 }
 
 }  // namespace mooncake
