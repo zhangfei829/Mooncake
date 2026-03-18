@@ -354,25 +354,12 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
                     abs_off & ~(static_cast<size_t>(block_size_) - 1);
                 size_t al = align_up(total);
 
-                // Copy user data → DMA buffer on the calling thread so the
-                // reactor only issues the NVMe command without any memcpy.
-                char *dst = static_cast<char *>(dma_bufs[slot]);
-                size_t copied = 0;
-                for (int j = 0; j < entries[idx].iovcnt; ++j) {
-                    std::memcpy(dst, entries[idx].iov[j].iov_base,
-                                entries[idx].iov[j].iov_len);
-                    dst += entries[idx].iov[j].iov_len;
-                    copied += entries[idx].iov[j].iov_len;
-                }
-                if (al > copied)
-                    std::memset(dst, 0, al - copied);
-
                 reqs[slot].op = SpdkIoRequest::WRITE;
                 reqs[slot].buf = dma_bufs[slot];
                 reqs[slot].offset = aligned_off;
                 reqs[slot].nbytes = al;
-                reqs[slot].src_iov = nullptr;
-                reqs[slot].src_iovcnt = 0;
+                reqs[slot].src_iov = entries[idx].iov;
+                reqs[slot].src_iovcnt = entries[idx].iovcnt;
                 reqs[slot].src_data = nullptr;
                 reqs[slot].src_len = 0;
                 reqs[slot].dst_iov = nullptr;
@@ -750,14 +737,6 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
         auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
         auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
 
-        // Per-slot copy info so the calling thread (not reactor) does memcpy.
-        struct ReadCopyInfo {
-            const iovec *dst_iov;
-            int dst_iovcnt;
-            size_t dst_skip;
-        };
-        auto copy_info = std::make_unique<ReadCopyInfo[]>(qd);
-
         int submitted = 0, completed = 0;
         int head = 0, tail = 0;
 
@@ -778,9 +757,6 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
                 size_t skip = abs_off - aligned_off;
                 size_t al = align_up(total + skip);
 
-                // Save copy info — calling thread will do DMA→user memcpy.
-                copy_info[slot] = {entries[idx].iov, entries[idx].iovcnt, skip};
-
                 reqs[slot].op = SpdkIoRequest::READ;
                 reqs[slot].buf = dma_bufs[slot];
                 reqs[slot].offset = aligned_off;
@@ -788,9 +764,9 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
                 reqs[slot].src_data = nullptr;
                 reqs[slot].src_iov = nullptr;
                 reqs[slot].src_iovcnt = 0;
-                reqs[slot].dst_iov = nullptr;
-                reqs[slot].dst_iovcnt = 0;
-                reqs[slot].dst_skip = 0;
+                reqs[slot].dst_iov = entries[idx].iov;
+                reqs[slot].dst_iovcnt = entries[idx].iovcnt;
+                reqs[slot].dst_skip = skip;
 
                 batch_ptrs[batch_count++] = &reqs[slot];
                 submitted++;
@@ -803,19 +779,8 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
             while (completed < submitted) {
                 if (!reqs[tail].completed.load(std::memory_order_acquire))
                     break;
-                if (reqs[tail].success) {
-                    // Copy DMA → user buffers on calling thread (not reactor).
-                    auto &ci = copy_info[tail];
-                    const char *src =
-                        static_cast<const char *>(dma_bufs[tail]) + ci.dst_skip;
-                    for (int j = 0; j < ci.dst_iovcnt; ++j) {
-                        std::memcpy(ci.dst_iov[j].iov_base, src,
-                                    ci.dst_iov[j].iov_len);
-                        src += ci.dst_iov[j].iov_len;
-                    }
-                } else if (first_err == ErrorCode::OK) {
+                if (!reqs[tail].success && first_err == ErrorCode::OK)
                     first_err = ErrorCode::FILE_READ_FAIL;
-                }
                 completed++;
                 tail = (tail + 1) % qd;
             }

@@ -777,13 +777,18 @@ static void SeqDirectWorker(SpdkEnv &env, size_t chunk_size,
     }
     qd = got;
 
-    std::unique_ptr<std::vector<char>[]> src_bufs;
+    // For writes, fill pattern data directly into DMA buffers BEFORE the
+    // timed section.  This eliminates per-request memcpy on the reactor
+    // thread — exactly matching the read path (which also has zero reactor
+    // memcpy).  Without this, large chunks (16 MB+) cause the reactor to
+    // block for ms on a single memcpy, starving NVMe completion processing.
     if (is_write) {
-        src_bufs = std::make_unique<std::vector<char>[]>(qd);
         for (int i = 0; i < qd; i++) {
-            src_bufs[i].resize(chunk_size);
-            FillPattern(src_bufs[i].data(), chunk_size,
+            FillPattern(static_cast<char *>(dma_bufs[i]), chunk_size,
                         static_cast<uint32_t>(i));
+            if (aligned_chunk > chunk_size)
+                std::memset(static_cast<char *>(dma_bufs[i]) + chunk_size,
+                            0, aligned_chunk - chunk_size);
         }
     }
 
@@ -808,20 +813,13 @@ static void SeqDirectWorker(SpdkEnv &env, size_t chunk_size,
             req.completed.store(false, std::memory_order_release);
             req.success = false;
             req._next_batch = nullptr;
+            req.src_data = nullptr;
+            req.src_len = 0;
+            req.src_iov = nullptr;
+            req.src_iovcnt = 0;
             req.dst_iov = nullptr;
             req.dst_iovcnt = 0;
             req.dst_skip = 0;
-            if (is_write) {
-                req.src_data = src_bufs[slot].data();
-                req.src_len = chunk_size;
-                req.src_iov = nullptr;
-                req.src_iovcnt = 0;
-            } else {
-                req.src_data = nullptr;
-                req.src_len = 0;
-                req.src_iov = nullptr;
-                req.src_iovcnt = 0;
-            }
             batch_ptrs[batch_count++] = &req;
             submitted++;
             next_offset += static_cast<off_t>(chunk_size);
@@ -910,13 +908,14 @@ static void RandDirectWorker(SpdkEnv &env, size_t io_size, size_t aligned_io,
     }
     qd = got;
 
-    std::unique_ptr<std::vector<char>[]> src_bufs;
+    // Fill DMA buffers directly for writes (same approach as SeqDirectWorker).
     if (is_write) {
-        src_bufs = std::make_unique<std::vector<char>[]>(qd);
         for (int i = 0; i < qd; i++) {
-            src_bufs[i].resize(io_size);
-            FillPattern(src_bufs[i].data(), io_size,
+            FillPattern(static_cast<char *>(dma_bufs[i]), io_size,
                         static_cast<uint32_t>(i));
+            if (aligned_io > io_size)
+                std::memset(static_cast<char *>(dma_bufs[i]) + io_size,
+                            0, aligned_io - io_size);
         }
     }
 
@@ -943,20 +942,13 @@ static void RandDirectWorker(SpdkEnv &env, size_t io_size, size_t aligned_io,
             req.completed.store(false, std::memory_order_release);
             req.success = false;
             req._next_batch = nullptr;
+            req.src_data = nullptr;
+            req.src_len = 0;
+            req.src_iov = nullptr;
+            req.src_iovcnt = 0;
             req.dst_iov = nullptr;
             req.dst_iovcnt = 0;
             req.dst_skip = 0;
-            if (is_write) {
-                req.src_data = src_bufs[slot].data();
-                req.src_len = io_size;
-                req.src_iov = nullptr;
-                req.src_iovcnt = 0;
-            } else {
-                req.src_data = nullptr;
-                req.src_len = 0;
-                req.src_iov = nullptr;
-                req.src_iovcnt = 0;
-            }
             if (submit_ts) submit_ts[slot] = Clock::now();
             batch_ptrs[batch_count++] = &req;
             submitted++;
