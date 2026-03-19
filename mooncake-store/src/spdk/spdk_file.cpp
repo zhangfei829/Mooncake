@@ -781,8 +781,9 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
                 size_t al = align_up(total + skip);
 
                 // Save iov info locally; reactor will skip scatter-copy.
-                slot_iovs[slot] = {entries[idx].iov, entries[idx].iovcnt,
-                                   skip};
+                slot_iovs[slot].iov = entries[idx].iov;
+                slot_iovs[slot].iovcnt = entries[idx].iovcnt;
+                slot_iovs[slot].skip = skip;
 
                 reqs[slot].op = SpdkIoRequest::READ;
                 reqs[slot].buf = dma_bufs[slot];
