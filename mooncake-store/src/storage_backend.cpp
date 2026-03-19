@@ -2605,8 +2605,16 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         decltype(allocator_->allocate(0))::value_type allocation;
     };
 
-    std::vector<WritePlan> write_plans;
-    write_plans.reserve(batch_object.size());
+    // First pass: compute sizes and filter entries (no lock needed).
+    struct PrePlan {
+        std::string key;
+        RecordHeader header;
+        size_t record_size;
+        uint32_t value_size;
+        const std::vector<Slice>* slices_ptr;
+    };
+    std::vector<PrePlan> pre_plans;
+    pre_plans.reserve(batch_object.size());
 
     for (const auto& [key, slices] : batch_object) {
         if (slices.empty()) continue;
@@ -2626,22 +2634,39 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         size_t record_size =
             RecordHeader::SIZE + header.key_len + header.value_len;
 
-        auto allocation = allocator_->allocate(record_size);
-        if (!allocation.has_value()) {
-            LOG(ERROR) << "Failed to allocate " << record_size
-                       << " bytes for key: " << key
-                       << " - stopping processing for this batch";
+        pre_plans.push_back(
+            PrePlan{key, header, record_size, value_size, &slices});
+    }
+
+    // Batch allocate: single lock acquisition for all keys.
+    std::vector<size_t> alloc_sizes;
+    alloc_sizes.reserve(pre_plans.size());
+    for (const auto& pp : pre_plans)
+        alloc_sizes.push_back(pp.record_size);
+
+    auto alloc_results = allocator_->batch_allocate(alloc_sizes);
+
+    std::vector<WritePlan> write_plans;
+    write_plans.reserve(pre_plans.size());
+
+    for (size_t i = 0; i < pre_plans.size(); ++i) {
+        if (i >= alloc_results.size() || !alloc_results[i].has_value()) {
+            if (i < alloc_results.size())
+                LOG(ERROR) << "Failed to allocate " << pre_plans[i].record_size
+                           << " bytes for key: " << pre_plans[i].key
+                           << " - stopping processing for this batch";
             break;
         }
 
+        auto& pp = pre_plans[i];
         WritePlan plan;
-        plan.key = key;
-        plan.header = header;
-        plan.offset = allocation->address();
-        plan.record_size = record_size;
-        plan.value_size = value_size;
-        plan.allocation = std::move(allocation.value());
-        plan.slices_ptr = &slices;
+        plan.key = std::move(pp.key);
+        plan.header = pp.header;
+        plan.offset = alloc_results[i]->address();
+        plan.record_size = pp.record_size;
+        plan.value_size = pp.value_size;
+        plan.allocation = std::move(alloc_results[i].value());
+        plan.slices_ptr = pp.slices_ptr;
         write_plans.push_back(std::move(plan));
     }
 

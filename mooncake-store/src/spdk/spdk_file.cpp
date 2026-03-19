@@ -383,6 +383,13 @@ tl::expected<void, ErrorCode> SpdkFile::vector_write_batch(
                 batch_ptrs[batch_count++] = &reqs[slot];
                 submitted++;
                 head = (head + 1) % qd;
+
+                // Submit early so NVMe starts processing while we
+                // prepare remaining entries (memcpy on calling thread).
+                if (batch_count >= 16) {
+                    env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+                    batch_count = 0;
+                }
             }
 
             if (batch_count > 0)

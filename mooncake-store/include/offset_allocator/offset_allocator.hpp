@@ -164,6 +164,11 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     std::optional<OffsetAllocationHandle> allocate(size_t size);
 
+    // Batch allocate: single lock acquisition for multiple allocations.
+    // Returns handles for successful allocations; stops on first failure.
+    std::vector<std::optional<OffsetAllocationHandle>>
+        batch_allocate(const std::vector<size_t>& sizes);
+
     // Get storage report (thread-safe)
     [[nodiscard]]
     OffsetAllocStorageReport storageReport() const;

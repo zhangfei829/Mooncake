@@ -618,6 +618,52 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         m_base + (allocation.getOffset() << m_multiplier_bits), size);
 }
 
+std::vector<std::optional<OffsetAllocationHandle>>
+OffsetAllocator::batch_allocate(const std::vector<size_t>& sizes) {
+    std::vector<std::optional<OffsetAllocationHandle>> results;
+    results.reserve(sizes.size());
+
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator) {
+        results.resize(sizes.size(), std::nullopt);
+        return results;
+    }
+
+    for (size_t size : sizes) {
+        if (size == 0) {
+            results.push_back(std::nullopt);
+            continue;
+        }
+
+        size_t fake_size =
+            m_multiplier_bits > 0
+                ? ((size + (static_cast<uint64_t>(1) << m_multiplier_bits) -
+                    1u) >>
+                   m_multiplier_bits)
+                : size;
+
+        if (fake_size > SmallFloat::MAX_BIN_SIZE) {
+            results.push_back(std::nullopt);
+            break;
+        }
+
+        OffsetAllocation allocation = m_allocator->allocate(fake_size);
+        if (allocation.isNoSpace()) {
+            results.push_back(std::nullopt);
+            break;
+        }
+
+        m_allocated_size += size;
+        m_allocated_num++;
+
+        results.emplace_back(OffsetAllocationHandle(
+            shared_from_this(), allocation,
+            m_base + (allocation.getOffset() << m_multiplier_bits), size));
+    }
+
+    return results;
+}
+
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
     MutexLocker guard(&m_mutex);
     if (!m_allocator) {
