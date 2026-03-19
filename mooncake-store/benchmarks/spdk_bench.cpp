@@ -759,10 +759,11 @@ static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
 // ============================================================================
 
 // Worker for one thread's share of sequential I/O via SubmitIoBatchAsync.
-// Write and read paths are identical inside the timed section: DMA buffers
-// are pre-filled for writes so the reactor has zero extra work (just
-// bdev_write / bdev_read).  Any write-vs-read throughput gap beyond this
-// point is purely NVMe hardware.
+// For writes, data is copied to the DMA buffer on the calling thread before
+// submission.  This serves two purposes:
+//   1. Reactor is free for NVMe command processing (no memcpy stall)
+//   2. The ~100 µs per-slot memcpy provides natural write pacing that
+//      prevents NVMe internal DMA-read congestion from bursty submissions
 static void SeqDirectWorker(SpdkEnv &env, size_t io_size,
                             size_t aligned_io, bool is_write,
                             off_t start_offset, size_t my_io_ops, int qd,
@@ -781,49 +782,18 @@ static void SeqDirectWorker(SpdkEnv &env, size_t io_size,
     }
     qd = got;
 
+    std::unique_ptr<std::vector<char>[]> src_bufs;
     if (is_write) {
+        src_bufs = std::make_unique<std::vector<char>[]>(qd);
         for (int i = 0; i < qd; i++) {
-            FillPattern(static_cast<char *>(dma_bufs[i]), io_size,
+            src_bufs[i].resize(io_size);
+            FillPattern(src_bufs[i].data(), io_size,
                         static_cast<uint32_t>(i));
-            if (aligned_io > io_size)
-                std::memset(static_cast<char *>(dma_bufs[i]) + io_size,
-                            0, aligned_io - io_size);
         }
     }
 
     auto reqs = std::make_unique<SpdkIoRequest[]>(qd);
     auto batch_ptrs = std::make_unique<SpdkIoRequest *[]>(qd);
-
-    // Warm-up: one full pipeline cycle (untimed) to prime NVMe write buffers
-    if (is_write) {
-        int wup_sub = 0, wup_comp = 0, wup_h = 0, wup_t = 0;
-        off_t wup_off = start_offset;
-        while (wup_sub < qd && wup_sub < static_cast<int>(my_io_ops)) {
-            auto &req = reqs[wup_h];
-            req.op = SpdkIoRequest::WRITE;
-            req.buf = dma_bufs[wup_h];
-            req.offset = static_cast<uint64_t>(wup_off);
-            req.nbytes = aligned_io;
-            req.completed.store(false, std::memory_order_release);
-            req.success = false;
-            req._next_batch = nullptr;
-            req.src_data = nullptr;  req.src_len = 0;
-            req.src_iov = nullptr;   req.src_iovcnt = 0;
-            req.dst_iov = nullptr;   req.dst_iovcnt = 0;
-            req.dst_skip = 0;
-            batch_ptrs[wup_sub] = &req;
-            wup_sub++;
-            wup_off += static_cast<off_t>(io_size);
-            wup_h = (wup_h + 1) % qd;
-        }
-        env.SubmitIoBatchAsync(batch_ptrs.get(), wup_sub);
-        while (wup_comp < wup_sub) {
-            if (reqs[wup_t].completed.load(std::memory_order_acquire)) {
-                wup_comp++;
-                wup_t = (wup_t + 1) % qd;
-            }
-        }
-    }
 
     int submitted = 0, completed = 0, head = 0, tail = 0;
     off_t next_offset = start_offset;
@@ -843,17 +813,28 @@ static void SeqDirectWorker(SpdkEnv &env, size_t io_size,
             req.completed.store(false, std::memory_order_release);
             req.success = false;
             req._next_batch = nullptr;
+            req.dst_iov = nullptr;
+            req.dst_iovcnt = 0;
+            req.dst_skip = 0;
+            if (is_write) {
+                std::memcpy(dma_bufs[slot], src_bufs[slot].data(), io_size);
+                if (aligned_io > io_size)
+                    std::memset(static_cast<char *>(dma_bufs[slot]) + io_size,
+                                0, aligned_io - io_size);
+            }
             req.src_data = nullptr;
             req.src_len = 0;
             req.src_iov = nullptr;
             req.src_iovcnt = 0;
-            req.dst_iov = nullptr;
-            req.dst_iovcnt = 0;
-            req.dst_skip = 0;
             batch_ptrs[batch_count++] = &req;
             submitted++;
             next_offset += static_cast<off_t>(io_size);
             head = (head + 1) % qd;
+
+            if (is_write && batch_count >= 8) {
+                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+                batch_count = 0;
+            }
         }
 
         if (batch_count > 0)
