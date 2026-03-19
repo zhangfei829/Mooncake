@@ -625,7 +625,8 @@ OffsetAllocator::batch_allocate(const std::vector<size_t>& sizes) {
 
     MutexLocker guard(&m_mutex);
     if (!m_allocator) {
-        results.resize(sizes.size(), std::nullopt);
+        for (size_t i = 0; i < sizes.size(); ++i)
+            results.emplace_back(std::nullopt);
         return results;
     }
 
