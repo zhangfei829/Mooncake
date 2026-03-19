@@ -881,13 +881,21 @@ static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
         kMaxDmaTotal / nthreads / aligned_io));
     per_qd = std::min(iodepth, per_qd);
 
-    // Keep the original address range (based on total_bytes) so repeated
-    // ops wrap around instead of touching new disk areas — avoids SLC cache
-    // exhaustion while giving the pipeline enough cycles to reach steady-state.
+    // For reads, boost ops so the pipeline reaches steady-state (ramp-up/down
+    // are amortised).  For writes, keep the original op count but reduce QD
+    // so that the existing ops still cover enough pipeline cycles.
     size_t original_total_ops = total_io_ops;
-    size_t min_ops_total = static_cast<size_t>(per_qd) * nthreads * 8;
-    if (total_io_ops < min_ops_total)
-        total_io_ops = min_ops_total;
+    if (!is_write) {
+        size_t min_ops_total = static_cast<size_t>(per_qd) * nthreads * 8;
+        if (total_io_ops < min_ops_total)
+            total_io_ops = min_ops_total;
+    } else {
+        // Cap QD so each thread gets at least 4 full pipeline cycles.
+        int ops_t = static_cast<int>(total_io_ops / nthreads);
+        int max_qd = std::max(2, ops_t / 4);
+        if (per_qd > max_qd)
+            per_qd = max_qd;
+    }
 
     size_t ops_per_thread = total_io_ops / nthreads;
     if (ops_per_thread == 0) { nthreads = 1; ops_per_thread = total_io_ops; }
