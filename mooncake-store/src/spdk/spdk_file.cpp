@@ -754,7 +754,7 @@ tl::expected<void, ErrorCode> SpdkFile::vector_read_batch(
 
         // Per-slot iov info for calling-thread scatter copy after completion.
         struct SlotIov {
-            struct iovec *iov;
+            const struct iovec *iov;
             int iovcnt;
             size_t skip;
         };
