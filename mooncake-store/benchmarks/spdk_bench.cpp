@@ -878,6 +878,12 @@ static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
         kMaxDmaTotal / nthreads / aligned_io));
     per_qd = std::min(iodepth, per_qd);
 
+    // Ensure enough ops per thread so the pipeline reaches steady-state.
+    // With only 2× QD ops, ramp-up/down dominate; 8× gives ~75 % steady.
+    size_t min_ops_total = static_cast<size_t>(per_qd) * nthreads * 8;
+    if (total_io_ops < min_ops_total)
+        total_io_ops = min_ops_total;
+
     size_t ops_per_thread = total_io_ops / nthreads;
     if (ops_per_thread == 0) { nthreads = 1; ops_per_thread = total_io_ops; }
 
