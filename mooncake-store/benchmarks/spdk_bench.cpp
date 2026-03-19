@@ -759,10 +759,9 @@ static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
 // ============================================================================
 
 // Worker for one thread's share of sequential I/O via SubmitIoBatchAsync.
-// Each NVMe request is at most `io_size` bytes; the caller splits large
-// logical chunks into multiple physical I/O ops so the reactor memcpy per
-// request stays bounded (~2 MB → ~100 µs), keeping NVMe completion
-// processing responsive.
+// For writes, data is copied to the DMA buffer on the CALLING thread,
+// keeping the reactor entirely free for NVMe command submission/completion.
+// The per-slot memcpy provides natural submission pacing.
 static void SeqDirectWorker(SpdkEnv &env, size_t io_size,
                             size_t aligned_io, bool is_write,
                             off_t start_offset, size_t my_io_ops, int qd,
@@ -816,20 +815,24 @@ static void SeqDirectWorker(SpdkEnv &env, size_t io_size,
             req.dst_iovcnt = 0;
             req.dst_skip = 0;
             if (is_write) {
-                req.src_data = src_bufs[slot].data();
-                req.src_len = io_size;
-                req.src_iov = nullptr;
-                req.src_iovcnt = 0;
-            } else {
-                req.src_data = nullptr;
-                req.src_len = 0;
-                req.src_iov = nullptr;
-                req.src_iovcnt = 0;
+                std::memcpy(dma_bufs[slot], src_bufs[slot].data(), io_size);
+                if (aligned_io > io_size)
+                    std::memset(static_cast<char *>(dma_bufs[slot]) + io_size,
+                                0, aligned_io - io_size);
             }
+            req.src_data = nullptr;
+            req.src_len = 0;
+            req.src_iov = nullptr;
+            req.src_iovcnt = 0;
             batch_ptrs[batch_count++] = &req;
             submitted++;
             next_offset += static_cast<off_t>(io_size);
             head = (head + 1) % qd;
+
+            if (is_write && batch_count >= 8) {
+                env.SubmitIoBatchAsync(batch_ptrs.get(), batch_count);
+                batch_count = 0;
+            }
         }
 
         if (batch_count > 0)

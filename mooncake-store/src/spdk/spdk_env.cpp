@@ -102,13 +102,34 @@ void execute_io_cb(void *ctx) {
 
 // ---------------------------------------------------------------------------
 // execute_io_batch_cb — batch callback: walk linked list, submit each I/O.
+// Yields after ~4 MB of write-side memcpy so the reactor can process NVMe
+// completions between sub-batches, preventing large memcpy bursts from
+// starving completion processing.
 // ---------------------------------------------------------------------------
 void execute_io_batch_cb(void *ctx) {
     auto &env = mooncake::SpdkEnv::Instance();
     auto *req = static_cast<mooncake::SpdkIoRequest *>(ctx);
+
+    static constexpr size_t kYieldAfterWriteBytes = 4ULL * 1024 * 1024;
+    size_t write_bytes = 0;
+
     while (req) {
         auto *next = req->_next_batch;
+
+        bool has_write_copy =
+            (req->op == mooncake::SpdkIoRequest::WRITE) &&
+            (req->src_data || (req->src_iov && req->src_iovcnt > 0));
+
         submit_single_io(req, env.bdev_desc_);
+
+        if (has_write_copy) {
+            write_bytes += req->nbytes;
+            if (write_bytes >= kYieldAfterWriteBytes && next) {
+                spdk_thread_send_msg(spdk_get_thread(),
+                                     execute_io_batch_cb, next);
+                return;
+            }
+        }
         req = next;
     }
 }
