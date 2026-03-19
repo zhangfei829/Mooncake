@@ -766,7 +766,8 @@ static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
 //      prevents NVMe internal DMA-read congestion from bursty submissions
 static void SeqDirectWorker(SpdkEnv &env, size_t io_size,
                             size_t aligned_io, bool is_write,
-                            off_t start_offset, size_t my_io_ops, int qd,
+                            off_t start_offset, size_t addr_range,
+                            size_t my_io_ops, int qd,
                             BandwidthResult *out) {
     if (my_io_ops == 0) return;
 
@@ -829,6 +830,8 @@ static void SeqDirectWorker(SpdkEnv &env, size_t io_size,
             batch_ptrs[batch_count++] = &req;
             submitted++;
             next_offset += static_cast<off_t>(io_size);
+            if (static_cast<size_t>(next_offset - start_offset) >= addr_range)
+                next_offset = start_offset;
             head = (head + 1) % qd;
 
             if (is_write && batch_count >= 8) {
@@ -878,14 +881,18 @@ static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
         kMaxDmaTotal / nthreads / aligned_io));
     per_qd = std::min(iodepth, per_qd);
 
-    // Ensure enough ops per thread so the pipeline reaches steady-state.
-    // With only 2× QD ops, ramp-up/down dominate; 8× gives ~75 % steady.
+    // Keep the original address range (based on total_bytes) so repeated
+    // ops wrap around instead of touching new disk areas — avoids SLC cache
+    // exhaustion while giving the pipeline enough cycles to reach steady-state.
+    size_t original_total_ops = total_io_ops;
     size_t min_ops_total = static_cast<size_t>(per_qd) * nthreads * 8;
     if (total_io_ops < min_ops_total)
         total_io_ops = min_ops_total;
 
     size_t ops_per_thread = total_io_ops / nthreads;
     if (ops_per_thread == 0) { nthreads = 1; ops_per_thread = total_io_ops; }
+    size_t orig_ops_per_thread = original_total_ops / nthreads;
+    if (orig_ops_per_thread == 0) orig_ops_per_thread = 1;
 
     std::vector<BandwidthResult> results(nthreads);
     std::vector<std::thread> threads;
@@ -894,10 +901,14 @@ static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
     for (int t = 0; t < nthreads; t++) {
         size_t my_ops = (t < nthreads - 1) ? ops_per_thread
                                             : (total_io_ops - ops_per_thread * t);
+        size_t my_addr_ops = (t < nthreads - 1)
+            ? orig_ops_per_thread
+            : (original_total_ops - orig_ops_per_thread * t);
+        size_t my_addr_range = my_addr_ops * io_size;
         threads.emplace_back(SeqDirectWorker, std::ref(env), io_size,
-                             aligned_io, is_write, offset, my_ops, per_qd,
-                             &results[t]);
-        offset += static_cast<off_t>(my_ops * io_size);
+                             aligned_io, is_write, offset, my_addr_range,
+                             my_ops, per_qd, &results[t]);
+        offset += static_cast<off_t>(my_addr_range);
     }
 
     for (auto &th : threads) th.join();
