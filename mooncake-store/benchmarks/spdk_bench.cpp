@@ -759,36 +759,35 @@ static BandwidthResult BenchSpdkRandAsyncMT(size_t io_size, size_t file_size,
 // ============================================================================
 
 // Worker for one thread's share of sequential I/O via SubmitIoBatchAsync.
-static void SeqDirectWorker(SpdkEnv &env, size_t chunk_size,
-                            size_t aligned_chunk, bool is_write,
-                            off_t start_offset, size_t my_ops, int qd,
+// Each NVMe request is at most `io_size` bytes; the caller splits large
+// logical chunks into multiple physical I/O ops so the reactor memcpy per
+// request stays bounded (~2 MB → ~100 µs), keeping NVMe completion
+// processing responsive.
+static void SeqDirectWorker(SpdkEnv &env, size_t io_size,
+                            size_t aligned_io, bool is_write,
+                            off_t start_offset, size_t my_io_ops, int qd,
                             BandwidthResult *out) {
-    if (my_ops == 0) return;
+    if (my_io_ops == 0) return;
 
     auto dma_bufs = std::make_unique<void *[]>(qd);
-    int got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_chunk, qd,
+    int got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_io, qd,
                                     env.GetBlockSize());
     if (got == 0) {
         for (int t = std::max(1, qd / 2); t >= 1 && got == 0;
              t = t > 1 ? t / 2 : 0)
-            got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_chunk, t,
+            got = env.DmaPoolAllocBatch(dma_bufs.get(), aligned_io, t,
                                         env.GetBlockSize());
         if (got == 0) { LOG(ERROR) << "DMA alloc failed"; return; }
     }
     qd = got;
 
-    // For writes, fill pattern data directly into DMA buffers BEFORE the
-    // timed section.  This eliminates per-request memcpy on the reactor
-    // thread — exactly matching the read path (which also has zero reactor
-    // memcpy).  Without this, large chunks (16 MB+) cause the reactor to
-    // block for ms on a single memcpy, starving NVMe completion processing.
+    std::unique_ptr<std::vector<char>[]> src_bufs;
     if (is_write) {
+        src_bufs = std::make_unique<std::vector<char>[]>(qd);
         for (int i = 0; i < qd; i++) {
-            FillPattern(static_cast<char *>(dma_bufs[i]), chunk_size,
+            src_bufs[i].resize(io_size);
+            FillPattern(src_bufs[i].data(), io_size,
                         static_cast<uint32_t>(i));
-            if (aligned_chunk > chunk_size)
-                std::memset(static_cast<char *>(dma_bufs[i]) + chunk_size,
-                            0, aligned_chunk - chunk_size);
         }
     }
 
@@ -800,29 +799,36 @@ static void SeqDirectWorker(SpdkEnv &env, size_t chunk_size,
 
     auto t0 = Clock::now();
 
-    while (completed < static_cast<int>(my_ops)) {
+    while (completed < static_cast<int>(my_io_ops)) {
         int batch_count = 0;
         while (submitted - completed < qd &&
-               submitted < static_cast<int>(my_ops)) {
+               submitted < static_cast<int>(my_io_ops)) {
             int slot = head;
             auto &req = reqs[slot];
             req.op = is_write ? SpdkIoRequest::WRITE : SpdkIoRequest::READ;
             req.buf = dma_bufs[slot];
             req.offset = static_cast<uint64_t>(next_offset);
-            req.nbytes = aligned_chunk;
+            req.nbytes = aligned_io;
             req.completed.store(false, std::memory_order_release);
             req.success = false;
             req._next_batch = nullptr;
-            req.src_data = nullptr;
-            req.src_len = 0;
-            req.src_iov = nullptr;
-            req.src_iovcnt = 0;
             req.dst_iov = nullptr;
             req.dst_iovcnt = 0;
             req.dst_skip = 0;
+            if (is_write) {
+                req.src_data = src_bufs[slot].data();
+                req.src_len = io_size;
+                req.src_iov = nullptr;
+                req.src_iovcnt = 0;
+            } else {
+                req.src_data = nullptr;
+                req.src_len = 0;
+                req.src_iov = nullptr;
+                req.src_iovcnt = 0;
+            }
             batch_ptrs[batch_count++] = &req;
             submitted++;
-            next_offset += static_cast<off_t>(chunk_size);
+            next_offset += static_cast<off_t>(io_size);
             head = (head + 1) % qd;
         }
 
@@ -832,7 +838,7 @@ static void SeqDirectWorker(SpdkEnv &env, size_t chunk_size,
         while (completed < submitted) {
             if (!reqs[tail].completed.load(std::memory_order_acquire))
                 break;
-            out->total_bytes += chunk_size;
+            out->total_bytes += io_size;
             out->total_ops++;
             completed++;
             tail = (tail + 1) % qd;
@@ -841,27 +847,34 @@ static void SeqDirectWorker(SpdkEnv &env, size_t chunk_size,
 
     out->total_secs =
         std::chrono::duration<double>(Clock::now() - t0).count();
-    env.DmaPoolFreeBatch(dma_bufs.get(), aligned_chunk, qd);
+    env.DmaPoolFreeBatch(dma_bufs.get(), aligned_io, qd);
 }
 
 static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
                                            size_t total_bytes, bool is_write,
                                            int iodepth) {
     auto &env = SpdkEnv::Instance();
-    size_t aligned_chunk = spdk_align_up(chunk_size);
-    size_t total_ops = total_bytes / chunk_size;
-    if (total_ops == 0) return {};
 
-    // Match VALUE-level concurrency: multiple calling threads each with
-    // independent QD pipeline, so total NVMe QD = nthreads × per_qd.
+    // Cap per-NVMe-request size: 2 MB keeps reactor memcpy at ~100 µs,
+    // proven to sustain line-rate writes.  Larger per-request sizes cause
+    // the reactor memcpy to starve NVMe completion processing.
+    static constexpr size_t kMaxIoSize = 2ULL * 1024 * 1024;
+    size_t io_size = std::min(chunk_size, kMaxIoSize);
+    size_t aligned_io = spdk_align_up(io_size);
+
+    size_t logical_chunks = total_bytes / chunk_size;
+    size_t sub_per_chunk = (chunk_size + io_size - 1) / io_size;
+    size_t total_io_ops = logical_chunks * sub_per_chunk;
+    if (total_io_ops == 0) return {};
+
     int nthreads = std::max(1, env.GetNumReactors() * 2);
     constexpr size_t kMaxDmaTotal = 256ULL * 1024 * 1024;
     int per_qd = std::max(2, static_cast<int>(
-        kMaxDmaTotal / nthreads / aligned_chunk));
+        kMaxDmaTotal / nthreads / aligned_io));
     per_qd = std::min(iodepth, per_qd);
 
-    size_t ops_per_thread = total_ops / nthreads;
-    if (ops_per_thread == 0) { nthreads = 1; ops_per_thread = total_ops; }
+    size_t ops_per_thread = total_io_ops / nthreads;
+    if (ops_per_thread == 0) { nthreads = 1; ops_per_thread = total_io_ops; }
 
     std::vector<BandwidthResult> results(nthreads);
     std::vector<std::thread> threads;
@@ -869,11 +882,11 @@ static BandwidthResult BenchSpdkSeqDirect(size_t chunk_size,
     off_t offset = 0;
     for (int t = 0; t < nthreads; t++) {
         size_t my_ops = (t < nthreads - 1) ? ops_per_thread
-                                            : (total_ops - ops_per_thread * t);
-        threads.emplace_back(SeqDirectWorker, std::ref(env), chunk_size,
-                             aligned_chunk, is_write, offset, my_ops, per_qd,
+                                            : (total_io_ops - ops_per_thread * t);
+        threads.emplace_back(SeqDirectWorker, std::ref(env), io_size,
+                             aligned_io, is_write, offset, my_ops, per_qd,
                              &results[t]);
-        offset += static_cast<off_t>(my_ops * chunk_size);
+        offset += static_cast<off_t>(my_ops * io_size);
     }
 
     for (auto &th : threads) th.join();
